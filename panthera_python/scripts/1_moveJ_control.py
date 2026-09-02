@@ -23,17 +23,14 @@ def main():
 
     # 运动到位置1，使用3秒到达
     robot.moveJ(pos1, duration=3.0, max_tqu=max_torque, iswait=True)
-    robot.gripper_close()
     time.sleep(2)
 
     # 运动到位置2，使用2.5秒到达
     robot.moveJ(pos2, duration=2.5, max_tqu=max_torque, iswait=True)
-    robot.gripper_open()
     time.sleep(2)
 
     # 运动到位置1，使用3秒到达
     robot.moveJ(pos1, duration=3.0, max_tqu=max_torque, iswait=True)
-    robot.gripper_close()
     time.sleep(2)
 
     # 回到零位，使用2秒到达

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-回放 *.jsonl 轨迹文件（单臂+夹爪）
-支持位置+速度+夹爪回放
+回放 *.jsonl 六关节轨迹文件（位置+速度）
 """
 import os,sys
 import numpy as np
@@ -13,10 +12,6 @@ TRAJECTORY_FILE = "trajectory_20260819_004049.jsonl"  # ← 改成实际记录�
 # 关节PD增益
 kp_play = [30.0, 40.0, 55.0, 15.0, 7.0, 5.0]        # 回放时刚度（可微调）
 kd_play = [3.0, 4.0, 5.5, 1.5, 0.7, 0.5]           # 回放时阻尼
-
-# 夹爪PD增益
-gripper_kp = 5.0   # 夹爪刚度
-gripper_kd = 0.5   # 夹爪阻尼
 
 # 摩擦补偿参数
 Fc = [0.15, 0.12, 0.12, 0.12, 0.04, 0.04]
@@ -38,10 +33,10 @@ if __name__ == "__main__":
     robot = Panthera(config_path)
 
     print(f"开始回放: {TRAJECTORY_FILE}")
-    print("数据格式: 自动检测（支持位置+速度+夹爪）")
+    print("数据格式: 位置+速度（六关节）")
 
     try:
-        # 一键回放（按记录时真实时间间隔发位置+速度+夹爪）
+        # 一键回放（按记录时真实时间间隔发送六关节位置+速度）
         TrajectoryRecorder.play(
             robot=robot,
             filepath=TRAJECTORY_FILE,
@@ -51,8 +46,6 @@ if __name__ == "__main__":
             fv=Fv,
             vel_threshold=vel_threshold,
             tau_limit=tau_limit,
-            gripper_kp=gripper_kp,
-            gripper_kd=gripper_kd
         )
 
     except KeyboardInterrupt:

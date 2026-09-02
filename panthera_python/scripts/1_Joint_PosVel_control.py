@@ -14,15 +14,12 @@ def main():
     time.sleep(1)
 
     robot.Joint_Pos_Vel(pos2, vel, max_torque, iswait=True)
-    robot.gripper_close()
     time.sleep(2)
 
     robot.Joint_Pos_Vel(pos1, vel, max_torque, iswait=True)
-    robot.gripper_open()
     time.sleep(2)
 
     robot.Joint_Pos_Vel(pos2, vel, max_torque, iswait=True)
-    robot.gripper_close()
     time.sleep(2)
 
     zero_success = robot.Joint_Pos_Vel(zero_pos, vel, max_torque, iswait=True)

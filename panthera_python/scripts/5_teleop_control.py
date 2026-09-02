@@ -38,20 +38,10 @@ def main():
     Leader.pos_vel_tqe_kp_kd(zero_pos, zero_vel, Leader_tor, zero_kp, zero_kd)
     Follower.pos_vel_tqe_kp_kd(Leader_positions, Leader_velocity, Follower_tor, kp, kd)
 
-    # *******夹爪控制*******
-    Leader_gripper_positions = Leader.get_current_pos_gripper()
-    Leader_gripper_velocity = Leader.get_current_vel_gripper()
-    Follower_gripper = Follower.get_current_state_gripper()
-    gripper_torque = Follower.get_friction_compensation(Leader_gripper_velocity, 0.06, 0.0, 0.15) - Follower_gripper.torque*0.5
-    tor_diff[np.abs(gripper_torque) < 0.2] = 0
-    Leader.gripper_control_MIT(1.5, 0, gripper_torque, 0.2, 0.02)
-    Follower.gripper_control_MIT(Leader_gripper_positions, Leader_gripper_velocity, 0, gripper_kp, gripper_kd)
-
-    # 打印6个关节信息
+    # 打印六个关节信息
     for i in range(Leader.motor_count):
         print(f"关节{i+1}: 位置={Leader_positions[i]:7.3f} rad, 速度={Leader_velocity[i]:7.3f} rad/s")
     print(f"反馈力矩：",tor_diff)
-    print(f"夹爪力矩: {gripper_torque:7.3f} Nm")
     print('-' * 40)
 
     time.sleep(0.001)
@@ -71,8 +61,6 @@ if __name__ == "__main__":
     zero_kd = [0.0] * Leader.motor_count
     kp = [10.0, 21.0, 21.0, 16.0, 13.0, 1.0]
     kd = [1.0, 2.0, 2.0, 0.9, 0.8, 0.1]
-    gripper_kp = 4.0
-    gripper_kd = 0.4
     # 库伦摩擦系数 Fc (Nm) - 恒定摩擦力，与速度大小无关
     Fc = np.array([0.15, 0.12, 0.12, 0.12, 0.04, 0.04])
     # 粘性摩擦系数 Fv (Nm·s/rad) - 线性速度相关摩擦系数

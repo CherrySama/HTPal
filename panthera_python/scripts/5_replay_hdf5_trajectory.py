@@ -29,16 +29,6 @@ RETURN_CONTROL_DT = 0.01
 RETURN_HOLD_DURATION = 0.2
 
 MAX_TORQUE = np.array([21.0, 36.0, 36.0, 21.0, 10.0, 10.0])
-GRIPPER_CLOSED_RAD = 0.0
-GRIPPER_OPEN_RAD = 1.6
-GRIPPER_MIT_VELOCITY = 0.0
-GRIPPER_MIT_TORQUE = 0.0
-GRIPPER_MIT_KP = 5.0
-GRIPPER_MIT_KD = 0.5
-GRIPPER_START_TOLERANCE = 0.05
-GRIPPER_START_TIMEOUT = 10.0
-GRIPPER_RETURN_TOLERANCE = 0.05
-GRIPPER_RETURN_TIMEOUT = 10.0
 # ---------------------------------------
 
 
@@ -55,8 +45,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_hdf5_trajectory(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """读取并校验 HDF5 关节和夹爪轨迹。"""
+def load_hdf5_trajectory(path: Path) -> np.ndarray:
+    """读取并校验 HDF5 六关节轨迹；旧七维文件只使用其中的六轴数据。"""
     if not path.is_file():
         raise FileNotFoundError(f"轨迹文件不存在：{path}")
 
@@ -68,29 +58,21 @@ def load_hdf5_trajectory(path: Path) -> tuple[np.ndarray, np.ndarray]:
 
         if schema_version != "panthera-single-v1":
             raise ValueError(f"不支持的 schema_version：{schema_version!r}")
-        if arm_mode != "single" or robot_type != "panthera-6dof" or state_dim != 7:
+        if arm_mode != "single" or robot_type != "panthera-6dof" or state_dim not in (6, 7):
             raise ValueError(
-                "HDF5 不是预期的 Panthera 六轴单臂七维数据："
+                "HDF5 不是预期的 Panthera 六轴单臂数据："
                 f"arm_mode={arm_mode!r}, robot_type={robot_type!r}, state_dim={state_dim!r}"
             )
 
         joint_pos = np.asarray(file["joint_action/arm"][...], dtype=float)
-        gripper = np.asarray(file["joint_action/gripper"][...], dtype=float)
 
     if joint_pos.ndim != 2 or joint_pos.shape[1] != 6:
         raise ValueError(f"关节轨迹形状必须是 (N, 6)，实际为 {joint_pos.shape}")
     if len(joint_pos) < 2:
         raise ValueError("轨迹至少需要两帧")
-    if gripper.shape != (len(joint_pos),):
-        raise ValueError(f"夹爪轨迹形状必须是 ({len(joint_pos)},)，实际为 {gripper.shape}")
-    if not np.all(np.isfinite(joint_pos)) or not np.all(np.isfinite(gripper)):
+    if not np.all(np.isfinite(joint_pos)):
         raise ValueError("轨迹包含 NaN 或无穷大")
-    if np.any(gripper < -1e-6) or np.any(gripper > 1.0 + 1e-6):
-        raise ValueError(
-            f"夹爪数据必须在 [0, 1]，实际范围为 [{gripper.min():.6f}, {gripper.max():.6f}]"
-        )
-
-    return joint_pos, np.clip(gripper, 0.0, 1.0)
+    return joint_pos
 
 
 def load_planner_trajectory(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -309,10 +291,9 @@ def segment_dynamics(values: np.ndarray, dt: float) -> tuple[np.ndarray, np.ndar
 def prepare_original_trajectory(
     joint_pos: np.ndarray,
     joint_velocity: np.ndarray,
-    gripper: np.ndarray,
     lower: np.ndarray,
     upper: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+) -> tuple[np.ndarray, np.ndarray, float, float]:
     """保持 HDF5 位置和时序，使用匹配得到的 TOPP 规划速度。"""
     validate_position_limits(joint_pos, lower, upper)
     if joint_velocity.shape != joint_pos.shape or not np.all(np.isfinite(joint_velocity)):
@@ -322,76 +303,7 @@ def prepare_original_trajectory(
         )
 
     playback_dt = SOURCE_DT
-    return joint_pos.copy(), gripper.copy(), joint_velocity.copy(), playback_dt, 1.0
-
-
-def map_gripper_to_radians(gripper: np.ndarray) -> np.ndarray:
-    """用端点线性近似将 RoboTwin [0, 1] 开度映射为真机电机角度。"""
-    return GRIPPER_CLOSED_RAD + np.clip(gripper, 0.0, 1.0) * (
-        GRIPPER_OPEN_RAD - GRIPPER_CLOSED_RAD
-    )
-
-
-def command_gripper_mit(robot, target_pos: float) -> None:
-    """使用仓库 JSON 回放参数发送夹爪 MIT 命令。"""
-    accepted = robot.gripper_control_MIT(
-        float(target_pos),
-        GRIPPER_MIT_VELOCITY,
-        GRIPPER_MIT_TORQUE,
-        GRIPPER_MIT_KP,
-        GRIPPER_MIT_KD,
-    )
-    if not accepted:
-        raise RuntimeError(f"夹爪 MIT 目标 {target_pos:.3f} rad 被拒绝")
-
-
-def move_gripper_to_start_mit(robot, target_pos: float) -> None:
-    """在主轨迹开始前用 MIT 移动夹爪，并等待电机角度到位。"""
-    print(f"夹爪使用 MIT 移动到起点：{target_pos:.3f} rad")
-    deadline = time.perf_counter() + GRIPPER_START_TIMEOUT
-    while True:
-        command_gripper_mit(robot, target_pos)
-        time.sleep(0.02)
-        robot.send_get_motor_state_cmd()
-        robot.motor_send_cmd()
-        current_pos = float(robot.get_current_pos_gripper())
-        if abs(current_pos - target_pos) <= GRIPPER_START_TOLERANCE:
-            print(f"夹爪已到达起点，实际角度 {current_pos:.3f} rad。")
-            return
-        if time.perf_counter() >= deadline:
-            raise RuntimeError(
-                f"夹爪未在 {GRIPPER_START_TIMEOUT:.1f} 秒内到达起点；"
-                f"目标 {target_pos:.3f} rad，实际 {current_pos:.3f} rad"
-            )
-
-
-def close_gripper_mit(robot) -> None:
-    """持续用 MIT 将夹爪闭合到配置的闭合角度，并确认反馈到位。"""
-    target_pos = float(GRIPPER_CLOSED_RAD)
-    deadline = time.perf_counter() + GRIPPER_RETURN_TIMEOUT
-    while True:
-        command_gripper_mit(robot, target_pos)
-        time.sleep(0.02)
-        robot.send_get_motor_state_cmd()
-        robot.motor_send_cmd()
-        current_pos = float(robot.get_current_pos_gripper())
-        if abs(current_pos - target_pos) <= GRIPPER_RETURN_TOLERANCE:
-            print(f"夹爪已闭合，实际角度 {current_pos:.3f} rad。")
-            return
-        if time.perf_counter() >= deadline:
-            raise RuntimeError(
-                f"夹爪未在 {GRIPPER_RETURN_TIMEOUT:.1f} 秒内闭合；"
-                f"目标 {target_pos:.3f} rad，实际 {current_pos:.3f} rad"
-            )
-
-
-def smoothstep_position(start: float, end: float, elapsed: float, duration: float) -> float:
-    """五次 smoothstep，令夹爪目标从 start 平滑过渡到 end。"""
-    if duration <= 0.0:
-        return float(end)
-    ratio = float(np.clip(elapsed / duration, 0.0, 1.0))
-    blend = ratio ** 3 * (10.0 - 15.0 * ratio + 6.0 * ratio ** 2)
-    return float(start + (end - start) * blend)
+    return joint_pos.copy(), joint_velocity.copy(), playback_dt, 1.0
 
 
 def next_tracking_plot_path() -> Path:
@@ -503,16 +415,13 @@ def build_smooth_return_trajectory(
 
 
 def return_to_zero(robot, max_torque: list[float]) -> None:
-    """从实际当前位置开始，六轴 5 秒平滑回零并闭合夹爪。"""
+    """从实际当前位置开始，六轴 5 秒平滑回零。"""
     robot.send_get_motor_state_cmd()
     robot.motor_send_cmd()
     time.sleep(0.05)
     start_pos = np.asarray(robot.get_current_pos(), dtype=float)
-    start_gripper_pos = float(robot.get_current_pos_gripper())
     if start_pos.shape != (robot.motor_count,) or not np.all(np.isfinite(start_pos)):
         raise RuntimeError(f"无法获得有效的当前关节位置：{start_pos}")
-    if not np.isfinite(start_gripper_pos):
-        raise RuntimeError(f"无法获得有效的当前夹爪位置：{start_gripper_pos}")
 
     sample_times, positions, velocities, accelerations = build_smooth_return_trajectory(
         robot,
@@ -546,8 +455,7 @@ def return_to_zero(robot, max_torque: list[float]) -> None:
 
     print(
         f"机械臂开始 {RETURN_TO_ZERO_DURATION:.1f} 秒平滑回零，"
-        f"预计峰值速度 {np.max(peak_velocity):.3f} rad/s，"
-        f"夹爪从 {start_gripper_pos:.3f} rad 慢慢闭合..."
+        f"预计峰值速度 {np.max(peak_velocity):.3f} rad/s..."
     )
     last_command_time = time.perf_counter()
     for sample_index in range(1, len(sample_times)):
@@ -562,27 +470,17 @@ def return_to_zero(robot, max_torque: list[float]) -> None:
             iswait=False,
         ):
             raise RuntimeError(f"回零第 {sample_index} 个控制点被拒绝")
-        # 与六轴回零同步发送五次 smoothstep 夹爪目标，避免目标角度瞬间跳变。
-        gripper_target = smoothstep_position(
-            start_gripper_pos,
-            GRIPPER_CLOSED_RAD,
-            float(sample_times[sample_index]),
-            RETURN_TO_ZERO_DURATION,
-        )
-        command_gripper_mit(robot, gripper_target)
         last_command_time = time.perf_counter()
 
     zero_pos = np.zeros(robot.motor_count, dtype=float)
     if not robot.wait_for_position(zero_pos, tolerance=0.05, timeout=5.0):
         raise RuntimeError("平滑回零结束后，关节未在容差内到达零位")
     print("机械臂已平滑回到零位。")
-    close_gripper_mit(robot)
 
 
 def play_trajectory(
     joint_pos: np.ndarray,
     joint_velocity: np.ndarray,
-    gripper_pos: np.ndarray,
     playback_dt: float,
     robot,
 ) -> None:
@@ -603,9 +501,6 @@ def play_trajectory(
     actual_positions: list[np.ndarray] = []
 
     try:
-        first_gripper_pos = float(gripper_pos[0])
-        move_gripper_to_start_mit(robot, first_gripper_pos)
-
         print(f"机械臂以 {POSITIONING_SPEED:.1f} rad/s 移动到轨迹起点...")
         reached = robot.Joint_Pos_Vel(
             joint_pos[0],
@@ -640,11 +535,6 @@ def play_trajectory(
                 iswait=False,
             ):
                 raise RuntimeError(f"第 {frame_index} 帧关节控制命令被拒绝")
-            try:
-                command_gripper_mit(robot, float(gripper_pos[frame_index]))
-            except RuntimeError as error:
-                raise RuntimeError(f"第 {frame_index} 帧{error}") from error
-
             expected_times.append(target_time)
             actual_times.append(time.perf_counter() - start_time)
             desired_positions.append(np.asarray(target_pos, dtype=float).copy())
@@ -672,7 +562,6 @@ def play_trajectory(
         print("轨迹完整回放结束。")
         returning_to_zero = True
         return_to_zero(robot, max_torque)
-        print("夹爪已闭合。")
     except KeyboardInterrupt:
         if returning_to_zero:
             robot.set_stop()
@@ -711,10 +600,8 @@ def print_preflight_report(
     planner_pos: np.ndarray,
     planner_segment_count: int,
     source_pos: np.ndarray,
-    source_gripper: np.ndarray,
     playback_pos: np.ndarray,
     playback_velocity: np.ndarray,
-    playback_gripper: np.ndarray,
     playback_dt: float,
     time_scale: float,
     matched_indices: np.ndarray,
@@ -768,18 +655,6 @@ def print_preflight_report(
     )
     print(f"起点关节位置：{np.array2string(playback_pos[0], precision=4)}")
     print(f"终点关节位置：{np.array2string(playback_pos[-1], precision=4)}")
-    print(
-        "夹爪归一化范围："
-        f"[{source_gripper.min():.3f}, {source_gripper.max():.3f}]，"
-        "真机映射范围："
-        f"[{playback_gripper.min():.3f}, {playback_gripper.max():.3f}] rad"
-    )
-    print(
-        "夹爪控制：MIT "
-        f"(vel={GRIPPER_MIT_VELOCITY:.1f}, tqe={GRIPPER_MIT_TORQUE:.1f}, "
-        f"kp={GRIPPER_MIT_KP:.1f}, kd={GRIPPER_MIT_KD:.1f})"
-    )
-    print("注意：夹爪 0～1.6 rad 为端点线性近似，真实开口宽度与电机角度可能非线性。")
 
 
 def main() -> int:
@@ -790,7 +665,7 @@ def main() -> int:
         if args.planner_trajectory is not None
         else trajectory_path.with_suffix(".pkl")
     )
-    source_pos, source_gripper = load_hdf5_trajectory(trajectory_path)
+    source_pos = load_hdf5_trajectory(trajectory_path)
     planner_pos, planner_velocity, segment_offsets = load_planner_trajectory(planner_path)
     planner_segment_count = len(segment_offsets) - 1
     (
@@ -807,18 +682,15 @@ def main() -> int:
     lower, upper, velocity_limits = load_joint_limits(CONFIG_PATH.resolve())
     (
         playback_pos,
-        playback_gripper_normalized,
         playback_velocity,
         playback_dt,
         time_scale,
     ) = prepare_original_trajectory(
         source_pos,
         matched_velocity,
-        source_gripper,
         lower,
         upper,
     )
-    playback_gripper = map_gripper_to_radians(playback_gripper_normalized)
 
     print(f"HDF5/PKL 轨迹检查与顺序匹配通过：{trajectory_path}")
     print_preflight_report(
@@ -826,10 +698,8 @@ def main() -> int:
         planner_pos,
         planner_segment_count,
         source_pos,
-        source_gripper,
         playback_pos,
         playback_velocity,
-        playback_gripper,
         playback_dt,
         time_scale,
         matched_indices,
@@ -851,7 +721,7 @@ def main() -> int:
     from Panthera_lib import Panthera
 
     robot = Panthera(str(CONFIG_PATH.resolve()))
-    play_trajectory(playback_pos, playback_velocity, playback_gripper, playback_dt, robot)
+    play_trajectory(playback_pos, playback_velocity, playback_dt, robot)
     return 0
 
 

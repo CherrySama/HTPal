@@ -7,15 +7,13 @@ Panthera-HT 机械臂 Quest 手柄笛卡尔空间控制程序
     2. 当右手柄 Squeeze 按下时，使用手柄位姿控制机械臂末端
     3. 使用逆运动学进行笛卡尔空间控制
     4. 使用 MIT 模式 + 重力/摩擦前馈进行关节控制
-    5. 支持夹爪开合控制
+    5. 仅控制六个关节，不包含夹爪
     6. 实时显示当前末端位置和手柄状态
 
 控制说明：
     按下右手柄 Squeeze（侧键）: 激活控制（必须按下才能控制）
     移动手柄位置: 控制末端位置
     旋转手柄姿态: 控制末端姿态
-    按住 Squeeze + 按下 Trigger（扳机键）: 根据按下程度控制夹爪
-    未按下 Squeeze 时操作 Trigger: 不触发夹爪动作
     松开 Squeeze: 停止运动，保持当前位置
     Ctrl+C: 退出程序
 """
@@ -281,15 +279,11 @@ def execute_smooth_joint_reset(
     Fc,
     Fv,
     vel_threshold,
-    gripper_pos,
-    gripper_vel,
-    gripper_kp,
-    gripper_kd,
     duration=2.0,
     control_dt=0.01,
     label="复位",
 ):
-    """使用平滑七次轨迹 + MIT 重力/摩擦前馈执行关节复位。"""
+    """使用平滑七次轨迹 + MIT 重力/摩擦前馈执行六关节复位。"""
     global running
 
     print("\n" + "=" * 60)
@@ -325,8 +319,6 @@ def execute_smooth_joint_reset(
             kp=kp,
             kd=kd
         )
-        robot.gripper_control_MIT(gripper_pos, gripper_vel, 0.0, gripper_kp, gripper_kd)
-
         if elapsed >= duration:
             break
         time.sleep(control_dt)
@@ -393,8 +385,6 @@ def main():
     print("  按下右手柄 Squeeze（侧键）: 激活控制（必须按下）")
     print("  移动手柄位置: 控制末端位置")
     print("  旋转手柄姿态: 控制末端姿态")
-    print("  按住 Squeeze + 按下 Trigger（扳机键）: 根据按下程度控制夹爪")
-    print("  未按下 Squeeze 时操作 Trigger: 不触发夹爪动作")
     print("  按下 A 键（Primary）: 复位到初始关节角")
     print("  松开 Squeeze: 停止运动，保持当前位置")
     print("  Ctrl+C: 退出程序")
@@ -428,14 +418,6 @@ def main():
     last_primary_pressed = 0
     reset_move_duration = 2.0
 
-    # 夹爪控制参数
-    gripper_open_pos = 1.6   # 夹爪完全打开位置
-    gripper_close_pos = 0.0  # 夹爪完全闭合位置
-    gripper_vel = 0.0        # 夹爪目标速度（MIT模式下通常为0）
-    gripper_kp = 3.0        # 夹爪位置增益
-    gripper_kd = 0.30         # 夹爪阻尼增益
-    last_gripper_pos = gripper_open_pos  # 记录上次夹爪位置
-
     try:
         while running:
             # 获取手柄数据
@@ -460,8 +442,6 @@ def main():
                 control_activated = False
                 last_hand_pos = None
                 last_hand_rot = None
-                gripper_tqe = 0.0
-                robot.gripper_control_MIT(last_gripper_pos, gripper_vel, gripper_tqe, gripper_kp, gripper_kd)
                 last_primary_pressed = 0
             elif is_hand_data_valid(right_info):
                 # 手柄数据有效，正常控制
@@ -481,17 +461,6 @@ def main():
 
                 current_hand_pos_robot = hand_pos_robot
 
-                # 夹爪控制：仅在按下 Squeeze 时，根据 trigger 值控制夹爪位置
-                # trigger: 0.0 (未按下) -> 夹爪打开 (1.6)
-                # trigger: 1.0 (完全按下) -> 夹爪闭合 (0.0)
-                if squeeze_value > squeeze_threshold:
-                    gripper_target_pos = gripper_open_pos - trigger_value * (gripper_open_pos - gripper_close_pos)
-                else:
-                    gripper_target_pos = last_gripper_pos
-                gripper_tqe = 0.0  # MIT模式下的前馈力矩
-                robot.gripper_control_MIT(gripper_target_pos, gripper_vel, gripper_tqe, gripper_kp, gripper_kd)
-                last_gripper_pos = gripper_target_pos  # 更新上次夹爪位置
-
                 if primary_pressed and not last_primary_pressed:
                     print("\n检测到 A 键按下，开始复位到初始关节角")
                     if execute_smooth_joint_reset(
@@ -502,10 +471,6 @@ def main():
                         Fc=Fc,
                         Fv=Fv,
                         vel_threshold=vel_threshold,
-                        gripper_pos=last_gripper_pos,
-                        gripper_vel=gripper_vel,
-                        gripper_kp=gripper_kp,
-                        gripper_kd=gripper_kd,
                         duration=reset_move_duration,
                         control_dt=control_rate,
                         label="A键复位",
@@ -593,8 +558,6 @@ def main():
                 control_activated = False
                 last_hand_pos = None
                 last_hand_rot = None
-                gripper_tqe = 0.0
-                robot.gripper_control_MIT(last_gripper_pos, gripper_vel, gripper_tqe, gripper_kp, gripper_kd)
                 last_primary_pressed = 0
 
             # 获取当前末端位姿（用于显示）
@@ -667,10 +630,6 @@ def main():
             Fc=Fc,
             Fv=Fv,
             vel_threshold=vel_threshold,
-            gripper_pos=last_gripper_pos,
-            gripper_vel=gripper_vel,
-            gripper_kp=gripper_kp,
-            gripper_kd=gripper_kd,
             duration=2.5,
             control_dt=control_rate,
             label="退出回零",

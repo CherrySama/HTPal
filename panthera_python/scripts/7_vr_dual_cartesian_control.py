@@ -9,7 +9,7 @@ Panthera-HT 双臂 Quest VR 笛卡尔空间遥操作程序
 控制说明:
     按住任一手柄 Squeeze: 激活对应机械臂控制
     移动/旋转手柄: 控制对应机械臂末端位姿
-    按住 Squeeze + Trigger: 控制对应夹爪开合
+    仅控制对应机械臂的六个关节，不包含夹爪
     左手柄 Primary(X) / 右手柄 Primary(A): 对应机械臂复位到启动姿态
     松开 Squeeze: 停止对应机械臂运动并保持当前位置
     Ctrl+C: 退出程序
@@ -49,13 +49,6 @@ Fc = np.array([0.20, 0.15, 0.15, 0.15, 0.04, 0.04])
 Fv = np.array([0.06, 0.06, 0.06, 0.03, 0.02, 0.02])
 vel_threshold = 0.02
 tau_limit = np.array([15.0, 30.0, 30.0, 15.0, 5.0, 5.0], dtype=np.float64)
-
-gripper_open_pos = 1.6
-gripper_close_pos = 0.0
-gripper_vel = 0.0
-gripper_kp = 3.0
-gripper_kd = 0.30
-
 
 def fmt_hand(name, vals):
     return {
@@ -276,7 +269,6 @@ def create_arm_state(robot, label):
         "last_valid_joint_pos": current_joint_pos.copy(),
         "initial_joint_pos": current_joint_pos.copy(),
         "last_primary_pressed": 0,
-        "last_gripper_pos": gripper_open_pos,
         "current_hand_pos_robot": None,
     }
 
@@ -319,14 +311,6 @@ def execute_smooth_joint_reset(arm_state, target_joint_pos, duration=2.0, label=
             kp=kp,
             kd=kd,
         )
-        robot.gripper_control_MIT(
-            arm_state["last_gripper_pos"],
-            gripper_vel,
-            0.0,
-            gripper_kp,
-            gripper_kd,
-        )
-
         if elapsed >= duration:
             break
         time.sleep(control_rate)
@@ -378,14 +362,6 @@ def execute_dual_smooth_joint_reset(arm_states, target_joint_positions, duration
                 kp=kp,
                 kd=kd,
             )
-            robot.gripper_control_MIT(
-                arm_state["last_gripper_pos"],
-                gripper_vel,
-                0.0,
-                gripper_kp,
-                gripper_kd,
-            )
-
         if elapsed >= duration:
             break
         time.sleep(control_rate)
@@ -432,13 +408,6 @@ def process_arm_control(arm_state, hand_info):
         arm_state["control_activated"] = False
         arm_state["last_hand_pos"] = None
         arm_state["last_hand_rot"] = None
-        robot.gripper_control_MIT(
-            arm_state["last_gripper_pos"],
-            gripper_vel,
-            0.0,
-            gripper_kp,
-            gripper_kd,
-        )
         arm_state["last_primary_pressed"] = 0
         return
 
@@ -451,14 +420,6 @@ def process_arm_control(arm_state, hand_info):
         quaternion_to_rotation_matrix(hand_info["rot"]),
     )
     arm_state["current_hand_pos_robot"] = hand_pos_robot
-
-    if squeeze_value > squeeze_threshold:
-        gripper_target_pos = gripper_open_pos - trigger_value * (gripper_open_pos - gripper_close_pos)
-    else:
-        gripper_target_pos = arm_state["last_gripper_pos"]
-
-    robot.gripper_control_MIT(gripper_target_pos, gripper_vel, 0.0, gripper_kp, gripper_kd)
-    arm_state["last_gripper_pos"] = gripper_target_pos
 
     if primary_pressed and not arm_state["last_primary_pressed"]:
         print(f"\n{arm_state['label']} 检测到复位按键，开始复位到启动姿态")
@@ -594,7 +555,7 @@ def main():
     print("\n控制说明:")
     print("  左手柄控制 Leader，右手柄控制 Follower")
     print("  按住对应手柄 Squeeze 后，移动/旋转手柄控制末端")
-    print("  按住 Squeeze + Trigger 控制对应夹爪")
+    print("  仅控制对应机械臂的六个关节")
     print("  左 Primary(X) / 右 Primary(A) 复位对应机械臂")
     print("  Ctrl+C 退出")
     print(f"  位置缩放因子: {position_scale}")

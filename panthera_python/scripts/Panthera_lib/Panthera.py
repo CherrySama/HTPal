@@ -35,12 +35,18 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
             config_path = os.path.normpath(
                 os.path.join(script_dir, "..", "..", "robot_param", "Follower.yaml")
             )
+        else:
+            config_path = os.path.abspath(config_path)
 
         # 初始化成员变量
         self._init_member_variables()
 
         # 加载配置文件
         self._load_config_file(config_path)
+
+        # 在初始化底层 SDK 前校验实际硬件配置，避免把不存在的电机（例如 ID 7）
+        # 交给 SDK 查询后进入连接等待。
+        self._validate_hardware_config(config_path)
 
         # 保存配置文件目录
         self.config_dir = os.path.dirname(os.path.abspath(config_path))
@@ -70,6 +76,7 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
         self.joint_ids = []
         self.joint_limits = None
         self.gripper_limits = None
+        self.gripper_enabled = None
         self.end_effector_frame_id = None
 
     def _load_config_file(self, config_path):
@@ -83,9 +90,59 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
             with open(config_path, 'r', encoding='utf-8') as f:
                 self.config = yaml.safe_load(f)
                 print(f"配置文件加载成功: {config_path}")
+                robot_config = self.config.get('robot', {}) or {}
+                if 'gripper_enabled' in robot_config:
+                    self.gripper_enabled = bool(robot_config['gripper_enabled'])
         except Exception as e:
             print(f"配置文件加载失败: {e}")
             sys.exit(1)
+
+    def _validate_hardware_config(self, config_path):
+        """在底层 SDK 初始化前校验电机数量，避免查询不存在的电机。"""
+        robot_config = self.config.get('robot', {}) or {}
+        joint_names = (self.config.get('kinematics', {}) or {}).get('joint_names', []) or []
+        if not joint_names:
+            raise ValueError("配置文件缺少 kinematics.joint_names，无法确定机械臂关节数量")
+
+        param_file = robot_config.get('param_file')
+        if not param_file:
+            raise ValueError("配置文件缺少 robot.param_file，无法确定底层电机配置")
+        if not os.path.isabs(param_file):
+            param_file = os.path.join(os.path.dirname(config_path), param_file)
+        param_file = os.path.abspath(param_file)
+        if not os.path.isfile(param_file):
+            raise FileNotFoundError(f"底层电机配置不存在: {param_file}")
+
+        with open(param_file, 'r', encoding='utf-8') as f:
+            motor_config = yaml.safe_load(f) or {}
+
+        ports = []
+        for board in (motor_config.get('robot', {}).get('CANboard', {}) or {}).values():
+            ports.extend((board.get('CANport', {}) or {}).values())
+
+        declared_motor_count = sum(int(port.get('motor_num', 0)) for port in ports)
+        motor_entries = []
+        for port in ports:
+            motor_entries.extend((port.get('motor', {}) or {}).values())
+        motor_ids = [int(motor['id']) for motor in motor_entries if 'id' in motor]
+
+        expected_arm_count = len(joint_names)
+        if self.gripper_enabled is False:
+            if declared_motor_count != expected_arm_count:
+                raise ValueError(
+                    f"无夹爪配置要求 {expected_arm_count} 个电机，但底层配置声明了 "
+                    f"{declared_motor_count} 个: {param_file}"
+                )
+            expected_ids = list(range(1, expected_arm_count + 1))
+            if sorted(motor_ids) != expected_ids:
+                raise ValueError(
+                    f"无夹爪配置要求电机 ID {expected_ids}，实际配置为 {sorted(motor_ids)}: "
+                    f"{param_file}"
+                )
+
+        self.hardware_param_file = param_file
+        self.configured_motor_count = declared_motor_count
+        print(f"底层电机配置校验通过: {param_file} (motor_num={declared_motor_count}, ids={sorted(motor_ids)})")
 
     def _load_joint_limits(self):
         """从配置文件加载关节限位"""
@@ -103,6 +160,10 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
 
     def _load_gripper_limits(self):
         """从配置文件加载夹爪限位"""
+        if self.gripper_enabled is False:
+            self.gripper_limits = None
+            print("夹爪已禁用，不加载夹爪限位")
+            return
         try:
             if 'robot' in self.config and 'gripper_limits' in self.config['robot']:
                 self.gripper_limits = {
@@ -117,11 +178,37 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
 
     def _init_motors(self):
         """初始化电机并打印电机信息"""
-        self.gripper_id = len(self.Motors)
-        self.motor_count = len(self.Motors) - 1
+        configured_arm_count = len(
+            (self.config.get('kinematics', {}) or {}).get('joint_names', []) or []
+        )
+        if self.gripper_enabled is None:
+            # 兼容旧配置：只有在电机数多于关节数时才推断存在夹爪。
+            self.gripper_enabled = len(self.Motors) > configured_arm_count
+
+        if not self.gripper_enabled:
+            # 旧配置可能仍保留 gripper_limits，但无夹爪时不应继续暴露它。
+            self.gripper_limits = None
+
+        if self.gripper_enabled:
+            if len(self.Motors) <= configured_arm_count:
+                raise ValueError(
+                    f"配置启用了夹爪，但 SDK 仅发现 {len(self.Motors)} 个电机，"
+                    f"无法满足 {configured_arm_count} 个关节加夹爪"
+                )
+            self.motor_count = len(self.Motors) - 1
+            self.gripper_id = len(self.Motors)  # 1-based 电机 ID/序号
+        else:
+            if len(self.Motors) != configured_arm_count:
+                raise ValueError(
+                    f"无夹爪配置要求 {configured_arm_count} 个电机，但 SDK 发现 "
+                    f"{len(self.Motors)} 个电机"
+                )
+            self.motor_count = len(self.Motors)
+            self.gripper_id = None
 
         print("初始化机械臂...")
         print(f"发现 {self.motor_count} 个电机")
+        print(f"夹爪: {'启用' if self.gripper_enabled else '禁用'}")
 
         if self.motor_count == 0:
             print("未发现电机。请检查您的配置和连接。")
@@ -272,22 +359,31 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
             joint_torques[i] = state.torque
         return joint_torques
 
+    def _require_gripper(self):
+        """检查当前配置是否包含夹爪，避免无夹爪时误访问 joint6。"""
+        if not self.gripper_enabled or self.gripper_id is None:
+            raise RuntimeError("当前 Panthera 配置未启用夹爪（仅包含六个关节电机）")
+
     def get_current_state_gripper(self):
         """获取当前夹爪状态"""
+        self._require_gripper()
         return self.Motors[self.gripper_id-1].get_current_motor_state()
     
     def get_current_pos_gripper(self):
         """获取当前夹爪位置"""
+        self._require_gripper()
         state = self.Motors[self.gripper_id-1].get_current_motor_state()
         return state.position
 
     def get_current_vel_gripper(self):
         """获取当前夹爪速度"""
+        self._require_gripper()
         state = self.Motors[self.gripper_id-1].get_current_motor_state()
         return state.velocity
     
     def get_current_torque_gripper(self):
         """获取当前夹爪力矩"""
+        self._require_gripper()
         state = self.Motors[self.gripper_id-1].get_current_motor_state()
         return state.torque
 
@@ -318,7 +414,7 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
         else:
             max_tqu = np.asarray(max_tqu)
 
-        # 检查关节数量（除了夹爪电机）
+        # 检查六个机械臂关节的参数数量
         if not (len(pos) == len(vel) == len(max_tqu) == self.motor_count):
             raise ValueError(f"关节参数长度必须为{self.motor_count}")
         # 转换为numpy数组
@@ -343,7 +439,7 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
                 print("="*60 + "\n")
                 return False
 
-        # 控制关节（除了夹爪电机）
+        # 控制机械臂关节
         for i in range(self.motor_count):
             motor = self.Motors[i]
             motor.pos_vel_MAXtqe(pos[i], vel[i], max_tqu[i])
@@ -405,7 +501,7 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
             vel = np.where(at_upper & (vel > 0), 0.0, vel)
             vel = np.where(at_lower & (vel < 0), 0.0, vel)
 
-        # 控制关节（除了夹爪电机）
+        # 控制机械臂关节
         for i in range(self.motor_count):
             motor = self.Motors[i]
             motor.velocity(vel[i])
@@ -479,7 +575,7 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
 
     def pos_vel_tqe_kp_kd(self, pos, vel, tqe, kp, kd):
         """关节五参数MIT控制模式"""
-        # 检查关节数量（除了夹爪电机）
+        # 检查六个机械臂关节的参数数量
         params = [pos, vel, tqe, kp, kd]
         if not all(len(p) == self.motor_count for p in params):
             raise ValueError(f"关节参数长度必须为{self.motor_count}")
@@ -506,7 +602,7 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
                 print("="*60 + "\n")
                 return False
 
-        # 控制关节（除了夹爪电机）
+        # 控制机械臂关节
         for i in range(self.motor_count):
             motor = self.Motors[i]
             motor.pos_vel_tqe_kp_kd(pos[i], vel[i], tqe[i], kp[i], kd[i])
@@ -518,6 +614,7 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
     #######################
     def gripper_control(self, pos, vel, max_tqu=0.5):
         """夹爪控制（位置速度最大力矩模式）"""
+        self._require_gripper()
         # 检查夹爪位置是否在限位范围内
         if self.gripper_limits is not None:
             lower = self.gripper_limits['lower']
@@ -540,6 +637,7 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
 
     def gripper_control_MIT(self, pos, vel, tqe, kp, kd):
         """夹爪控制（5参数MIT模式）"""
+        self._require_gripper()
         # 检查夹爪位置是否在限位范围内
         if self.gripper_limits is not None:
             lower = self.gripper_limits['lower']

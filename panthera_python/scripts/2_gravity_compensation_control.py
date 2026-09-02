@@ -13,7 +13,6 @@ def main():
     tau_limit = np.array([15.0, 30.0, 30.0, 15.0, 5.0, 5.0])
     tor = np.clip(tor, -tau_limit, tau_limit)
     robot.pos_vel_tqe_kp_kd(zero_pos, zero_vel, tor, zero_kp, zero_kd)
-    robot.gripper_control_MIT(0,0,0,0,0)
     print(f"重力补偿力矩：",tor)
     time.sleep(0.002)
     #结束后电机会自动掉电，请注意安全！！

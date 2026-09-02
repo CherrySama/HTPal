@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-单主臂重力补偿程序 + 实时轨迹记录（位置+速度+夹爪）
+单臂重力补偿程序 + 实时六关节轨迹记录（位置+速度）
 """
 import os
 import time
@@ -21,10 +21,6 @@ def main():
     Leader_positions = Leader.get_current_pos()
     Leader_velocity = Leader.get_current_vel()
 
-    # 获取夹爪当前状态
-    gripper_pos = Leader.get_current_pos_gripper()
-    gripper_vel = Leader.get_current_vel_gripper()
-
     # 计算重力补偿力矩
     Leader_gra = Leader.get_Gravity(Leader_positions)
 
@@ -39,9 +35,6 @@ def main():
     # 零刚度零阻尼控制（重力补偿模式，可自由拖动）
     Leader.pos_vel_tqe_kp_kd(zero_pos, zero_vel, Leader_tor, zero_kp, zero_kd)
 
-    # 夹爪零刚度零阻尼控制（可自由拖动）
-    Leader.gripper_control_MIT(0.0, 0.0, 0.0, 0.0, 0.0)
-
     # 限频打印，避免终端输出拖慢控制循环
     global last_print_time
     now = time.perf_counter()
@@ -49,10 +42,9 @@ def main():
         print("\r", end="")
         for i in range(Leader.motor_count):
             print(f"J{i+1}: {Leader_positions[i]:6.3f}rad {Leader_velocity[i]:6.3f}rad/s | ", end="")
-        print(f"夹爪: {gripper_pos:6.3f}rad {gripper_vel:6.3f}rad/s   ", end="", flush=True)
         last_print_time = now
 
-    return Leader_positions, Leader_velocity, gripper_pos, gripper_vel
+    return Leader_positions, Leader_velocity
 
 if __name__ == "__main__":
     # 创建机器人实例
@@ -75,7 +67,7 @@ if __name__ == "__main__":
     # 实例化记录器（如开启记录）
     if DO_RECORD:
         rec = TrajectoryRecorder(REC_FILE)
-        print("开始记录轨迹（位置+速度+夹爪）...")
+        print("开始记录轨迹（六关节位置+速度）...")
 
     try:
         # 记录轨迹之前先循环发送读取指令，避免未接收到关节状态导致关节角为999
@@ -88,7 +80,7 @@ if __name__ == "__main__":
             state = main()                    # 重力补偿控制循环
             now = time.perf_counter()
             if DO_RECORD and now >= next_record_time:
-                # 记录关节位置速度 + 夹爪位置速度
+                # 记录六个关节的位置和速度
                 rec.log(*state)
                 next_record_time += RECORD_DT
             next_time += CONTROL_DT

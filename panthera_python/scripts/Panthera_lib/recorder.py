@@ -18,7 +18,7 @@ class Recorder:
         self.last_flush = time.perf_counter()
 
     # ---------------- 记录 ----------------
-    def log(self, pos: List[float], vel: List[float] = None, gripper_pos: float = None, gripper_vel: float = None):
+    def log(self, pos: List[float], vel: List[float] = None):
         t = time.perf_counter()
         if self.t0 is None:
             self.t0 = t
@@ -26,10 +26,6 @@ class Recorder:
         data = {"t": t - self.t0, "pos": list(pos)}
         if vel is not None:
             data["vel"] = list(vel)
-        if gripper_pos is not None:
-            data["gripper_pos"] = gripper_pos
-        if gripper_vel is not None:
-            data["gripper_vel"] = gripper_vel
         line = json.dumps(data, ensure_ascii=False)
         self.fd.write(line + "\n")
         if t - self.last_flush >= self.flush_interval:
@@ -53,8 +49,6 @@ class Recorder:
         fv: Optional[List[float]] = None,
         vel_threshold: float = 0.0,
         tau_limit: Optional[List[float]] = None,
-        gripper_kp: float = 5.0,
-        gripper_kd: float = 0.5,
         playback_dt: float = 0.01,
         smooth_window: int = 7,
         mode: str = "mit",
@@ -78,13 +72,6 @@ class Recorder:
         start_pos = first_frame["pos"]
         move_vel = [0.5] * len(start_pos)  # 缓慢速度 0.5 rad/s
 
-        # 夹爪移动到起点（如果有夹爪数据）
-        if "gripper_pos" in first_frame:
-            gripper_start_pos = first_frame["gripper_pos"]
-            print(f"[Player] 夹爪移动到起点: {gripper_start_pos:.3f} rad")
-            robot.gripper_control(gripper_start_pos, 0.5, 0.5)
-            time.sleep(2.0)  # 等待夹爪到达
-
         # 缓慢移动到起点，等待到达
         robot.Joint_Pos_Vel(start_pos, move_vel, max_torque, iswait=True, tolerance=0.05, timeout=30.0)
 
@@ -107,10 +94,6 @@ class Recorder:
                 robot.Joint_Pos_Vel(f["pos"], f["vel"], max_torque)
             else:
                 raise ValueError("mode 必须是 'mit' 或 'posvel'")
-
-            # 夹爪控制（如果有夹爪数据）
-            if "gripper_pos" in f:
-                robot.gripper_control_MIT(f["gripper_pos"], f["gripper_vel"], 0.0, gripper_kp, gripper_kd)
 
         print("[Player] 回放完成")
 
@@ -140,17 +123,6 @@ class Recorder:
         new_pos = Recorder._moving_average(new_pos, smooth_window)
         new_vel = np.gradient(new_pos, new_t, axis=0)
 
-        has_gripper_pos = "gripper_pos" in kept_frames[0]
-        has_gripper_vel = "gripper_vel" in kept_frames[0]
-        if has_gripper_pos:
-            gripper_pos = np.array([f["gripper_pos"] for f in kept_frames], dtype=float)
-            new_gripper_pos = np.interp(new_t, t, gripper_pos)
-            new_gripper_pos = Recorder._moving_average(new_gripper_pos[:, None], smooth_window)[:, 0]
-            if has_gripper_vel:
-                new_gripper_vel = np.gradient(new_gripper_pos, new_t)
-            else:
-                new_gripper_vel = np.zeros_like(new_gripper_pos)
-
         prepared = []
         for i, timestamp in enumerate(new_t):
             item = {
@@ -158,9 +130,6 @@ class Recorder:
                 "pos": new_pos[i].tolist(),
                 "vel": new_vel[i].tolist(),
             }
-            if has_gripper_pos:
-                item["gripper_pos"] = float(new_gripper_pos[i])
-                item["gripper_vel"] = float(new_gripper_vel[i])
             prepared.append(item)
         return prepared
 

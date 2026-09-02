@@ -13,7 +13,8 @@ if __name__ == "__main__":
     try:
         while True:
             t = time.time()
-            target_vel = [0.2 if (math.floor(t) % 6) >= 3 else -0.2] + [0.0] * (robot.motor_count - 1)
+            target_vel = [0.0] * robot.motor_count
+            target_vel[0] = 0.2 if (math.floor(t) % 6) >= 3 else -0.2
             robot.Joint_Vel(target_vel)
 
             # 打印状态

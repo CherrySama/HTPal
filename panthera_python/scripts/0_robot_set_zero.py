@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 获取并打印机械臂关节角度信息
-实时显示6个关节和夹爪的当前状态
+设置零位后实时显示六个关节的当前状态（当前硬件无夹爪）
 """
 
 import time
@@ -16,19 +16,13 @@ def print_robot_state(robot):
     positions = robot.get_current_pos()
     velocities = robot.get_current_vel()
 
-    # 获取夹爪状态
-    gripper_state = robot.Motors[6].get_current_motor_state()
-    
     print("\n" + "="*50)
     print("机械臂状态信息")
     print("="*50)
     
-    # 打印6个关节信息
+    # 打印六个关节信息
     for i in range(robot.motor_count):
         print(f"关节{i+1}: 位置={positions[i]:7.3f} rad, 速度={velocities[i]:7.3f} rad/s")
-    
-    # 打印夹爪信息
-    print(f"夹爪:   位置={gripper_state.position:7.3f} rad, 速度={gripper_state.velocity:7.3f} rad/s")
 
 def main():
     robot = Panthera()
