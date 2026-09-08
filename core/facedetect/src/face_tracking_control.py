@@ -51,6 +51,8 @@ DEFAULT_MODEL = (
     / "det_500m.onnx"
 )
 DEFAULT_POSITION_FILE = REPO_ROOT / "core" / "detect_test_pos.md"
+DEFAULT_LEFT_POSITION_FILE = REPO_ROOT / "core" / "detect_test_pos_left.md"
+DEFAULT_RIGHT_POSITION_FILE = REPO_ROOT / "core" / "detect_test_pos_right.md"
 DEFAULT_CONFIG_FILE = REPO_ROOT / "panthera_python" / "robot_param" / "Follower_tracking.yaml"
 DEFAULT_CALIBRATION_FILE = REPO_ROOT / "panthera_python" / "config" / "hand_eye_calibration.json"
 DEFAULT_HAND_MODEL = REPO_ROOT / "core" / "handdetect" / "model" / "hand_landmarker.task"
@@ -65,6 +67,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-motion", action="store_true", help="允许发送跟踪电机命令")
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help="SCRFD ONNX 权重路径")
     parser.add_argument("--position-file", type=Path, default=DEFAULT_POSITION_FILE, help="HOME 六关节位置文件")
+    parser.add_argument("--left-position-file", type=Path, default=DEFAULT_LEFT_POSITION_FILE, help="左竖屏六关节标定文件")
+    parser.add_argument("--right-position-file", type=Path, default=DEFAULT_RIGHT_POSITION_FILE, help="右竖屏六关节标定文件")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_FILE, help="Panthera 配置文件")
     parser.add_argument("--calibration", type=Path, default=DEFAULT_CALIBRATION_FILE, help="手眼标定 JSON")
     parser.add_argument("--width", type=int, default=640)
@@ -113,6 +117,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-joint-speed", type=float, default=0.15, help="跟踪最大关节速度（rad/s）")
     parser.add_argument("--max-joint-accel", type=float, default=0.30, help="跟踪最大关节加速度（rad/s²）")
+    parser.add_argument("--screen-rotation-speed", type=float, default=0.40, help="屏幕 J6 旋转速度（rad/s）")
+    parser.add_argument("--screen-rotation-accel", type=float, default=0.60, help="屏幕 J6 旋转加速度（rad/s²）")
     parser.add_argument("--qp-position-gain", type=float, default=4.5, help="QP 末端位置反馈增益")
     parser.add_argument("--qp-rotation-gain", type=float, default=4.0, help="QP 末端姿态反馈增益")
     parser.add_argument("--max-cartesian-speed", type=float, default=0.15, help="QP 末端线速度上限（m/s）")
@@ -162,6 +168,8 @@ def validate_args(args: argparse.Namespace) -> None:
         (args.model, "SCRFD 模型"),
         (args.hand_model, "Hand Landmarker 模型"),
         (args.position_file, "HOME 位置文件"),
+        (args.left_position_file, "左竖屏位置文件"),
+        (args.right_position_file, "右竖屏位置文件"),
         (args.config, "机械臂配置"),
         (args.calibration, "手眼标定文件"),
     ):
@@ -190,6 +198,8 @@ def validate_args(args: argparse.Namespace) -> None:
         args.control_period,
         args.max_joint_speed,
         args.max_joint_accel,
+        args.screen_rotation_speed,
+        args.screen_rotation_accel,
         args.qp_position_gain,
         args.qp_rotation_gain,
         args.max_cartesian_speed,
@@ -527,17 +537,41 @@ class TrackingController:
         home_position: np.ndarray,
         camera_rotation: np.ndarray,
         screen_rotation: np.ndarray,
+        left_position: np.ndarray,
+        right_position: np.ndarray,
         args: argparse.Namespace,
     ):
         self.robot = robot
         self.home_position = home_position
         self.preferred_home_position = home_position.copy()
         self.camera_rotation = camera_rotation
-        self.screen_rotation_landscape = np.asarray(screen_rotation, dtype=np.float64).copy()
         self.screen_rotation = np.asarray(screen_rotation, dtype=np.float64).copy()
         self.screen_distance = float(args.screen_distance)
         self.screen_orientation = "LANDSCAPE"
         self.screen_joint6_target = None
+        self.pending_screen_orientation = None
+        self.landscape_position = np.asarray(home_position, dtype=np.float64).copy()
+        self.left_position = np.asarray(left_position, dtype=np.float64).copy()
+        self.right_position = np.asarray(right_position, dtype=np.float64).copy()
+        calibration_positions = {
+            "LANDSCAPE": self.landscape_position,
+            "PORTRAIT_LEFT": self.left_position,
+            "PORTRAIT_RIGHT": self.right_position,
+        }
+        if any(
+            position.shape != (JOINT_COUNT,) or not np.all(np.isfinite(position))
+            for position in calibration_positions.values()
+        ):
+            raise ValueError("横屏/左右竖屏标定文件必须各包含六个有效关节位置")
+        for orientation, position in calibration_positions.items():
+            if np.max(np.abs(position[:5] - self.landscape_position[:5])) > 0.02:
+                raise ValueError(
+                    f"{orientation} 标定姿态的 J1~J5 与横屏 HOME 不一致，不能安全执行 J6-only 旋转"
+                )
+        self.calibration_j6 = {
+            orientation: float(position[5])
+            for orientation, position in calibration_positions.items()
+        }
         self.args = args
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
@@ -588,6 +622,7 @@ class TrackingController:
             self.limit_hold_reported = False
             self.limit_hold_reason = None
             self.screen_joint6_target = None
+            self.pending_screen_orientation = None
             if not enabled:
                 self.desired_joint = self.command_joint.copy()
                 self.status = "HOLD"
@@ -615,20 +650,24 @@ class TrackingController:
                 return
 
             orientation = gesture_state.orientation
-            if orientation == "PORTRAIT_LEFT":
-                joint6_target = float(self.home_position[5] - 0.5 * math.pi)
-            elif orientation == "PORTRAIT_RIGHT":
-                joint6_target = float(self.home_position[5] + 0.5 * math.pi)
-            elif orientation == "LANDSCAPE":
-                joint6_target = float(self.home_position[5])
-            else:
+            if orientation not in self.calibration_j6:
                 raise ValueError(f"未知屏幕姿态：{orientation}")
+            if self.screen_orientation not in self.calibration_j6:
+                raise ValueError(f"当前屏幕姿态无标定值：{self.screen_orientation}")
+            actual_q = np.asarray(self.robot.get_current_pos(), dtype=np.float64)
+            if actual_q.shape != (JOINT_COUNT,) or not np.all(np.isfinite(actual_q)):
+                raise RuntimeError("无法读取旋转开始时的实际六关节角度")
+            calibration_delta = (
+                self.calibration_j6[orientation]
+                - self.calibration_j6[self.screen_orientation]
+            )
+            joint6_target = float(actual_q[5] + calibration_delta)
             if not self.safe_lower[5] <= joint6_target <= self.safe_upper[5]:
                 raise ValueError(
                     f"J6 目标 {joint6_target:+.3f} rad 超出安全范围 "
                     f"[{self.safe_lower[5]:+.3f}, {self.safe_upper[5]:+.3f}]"
                 )
-            self.screen_orientation = orientation
+            self.pending_screen_orientation = orientation
             self.screen_joint6_target = joint6_target
             self.cartesian_command_ready = False
             self.cartesian_command_velocity.fill(0.0)
@@ -638,7 +677,7 @@ class TrackingController:
             self.status = "ROTATING_SCREEN"
             print(
                 f"手势 {event}：进入 {orientation}，只旋转 J6 到 "
-                f"{joint6_target:+.3f} rad"
+                f"{joint6_target:+.3f} rad（标定增量 {calibration_delta:+.3f} rad）"
             )
 
     def gesture_snapshot(self) -> tuple[float, str]:
@@ -657,6 +696,78 @@ class TrackingController:
         self.stop_event.set()
         self.thread.join(timeout=2.0)
 
+    def _run_rotation_once(self, target_joint6: float, fresh: bool, enabled: bool) -> None:
+        """Execute one blocking J6 move, then return to normal tracking."""
+        actual_q = np.asarray(self.robot.get_current_pos(), dtype=np.float64)
+        if actual_q.shape != (JOINT_COUNT,) or not np.all(np.isfinite(actual_q)):
+            raise RuntimeError("无法读取旋转开始时的实际六关节角度")
+        target_q = actual_q.copy()
+        target_q[5] = float(target_joint6)
+
+        if self.args.enable_motion:
+            velocity = [0.0] * JOINT_COUNT
+            velocity[5] = min(
+                float(self.args.screen_rotation_speed),
+                float(getattr(self.robot, "velocity_limits", [1.0] * JOINT_COUNT)[5]),
+            )
+            reached = bool(self.robot.Joint_Pos_Vel(
+                target_q.tolist(), velocity, self.robot.max_torque.tolist(),
+                iswait=True, tolerance=0.02, timeout=10.0,
+            ))
+            completion_q = np.asarray(self.robot.get_current_pos(), dtype=np.float64)
+        else:
+            reached = True
+            completion_q = target_q
+
+        if (
+            not reached
+            or completion_q.shape != (JOINT_COUNT,)
+            or not np.all(np.isfinite(completion_q))
+            or abs(float(completion_q[5] - target_joint6)) > 0.02
+        ):
+            with self.lock:
+                self.screen_joint6_target = None
+                self.pending_screen_orientation = None
+                self.command_velocity.fill(0.0)
+                self.desired_joint = self.command_joint.copy()
+                self.status = "ROTATION_FAILED"
+            print(
+                f"J6 旋转失败：目标 {target_joint6:+.3f} rad，"
+                f"实际 {float(completion_q[5]) if completion_q.shape == (JOINT_COUNT,) else float('nan'):+.3f} rad",
+                file=sys.stderr,
+            )
+            return
+
+        rotation_fk = self.robot.forward_kinematics(completion_q)
+        if rotation_fk is None:
+            raise RuntimeError("J6 旋转后无法计算屏幕姿态")
+        with self.lock:
+            completed_orientation = self.pending_screen_orientation
+            if completed_orientation is None:
+                raise RuntimeError("旋转完成但没有待切换屏幕姿态")
+            self.command_joint = completion_q.copy()
+            self.desired_joint = completion_q.copy()
+            self.command_velocity.fill(0.0)
+            self.cartesian_command_ready = False
+            self.cartesian_command_velocity.fill(0.0)
+            self.screen_rotation = np.asarray(rotation_fk["rotation"], dtype=np.float64)
+            self.preferred_home_position[5] = completion_q[5]
+            self.screen_orientation = completed_orientation
+            self.pending_screen_orientation = None
+            self.screen_joint6_target = None
+            self.last_ik_target = None
+            self.smoothed_target = None
+            self.lost_since = None
+            self.normal_saturation = None
+            self.normal_saturation_direction = 0.0
+            self.limit_hold_reported = False
+            self.limit_hold_reason = None
+            self.status = "TRACKING" if fresh and enabled else "HOLD"
+        print(
+            f"J6 旋转完成：{self.screen_orientation}；"
+            "已切换为新的固定屏幕姿态并恢复跟随。"
+        )
+
     def _loop(self) -> None:
         previous_time = time.monotonic()
         while not self.stop_event.is_set():
@@ -672,18 +783,17 @@ class TrackingController:
                 screen_joint6_target = self.screen_joint6_target
                 command_joint = self.command_joint.copy()
                 command_velocity = self.command_velocity.copy()
+                cycle_max_speed = self.max_speed.copy()
+                cycle_max_accel = self.max_accel.copy()
             fresh = point_camera is not None and target_time is not None and now - target_time <= self.args.target_timeout
 
             try:
                 if screen_joint6_target is not None:
-                    with self.lock:
-                        self.status = "ROTATING_SCREEN"
-                        self.cartesian_command_ready = False
-                        self.cartesian_command_velocity.fill(0.0)
-                        self.desired_joint = self.command_joint.copy()
-                        self.command_velocity[:5] = 0.0
-                        self.desired_joint[:5] = self.command_joint[:5]
-                        self.desired_joint[5] = screen_joint6_target
+                    self._run_rotation_once(screen_joint6_target, fresh, enabled)
+                    remaining = self.args.control_period - (time.perf_counter() - cycle_start)
+                    if remaining > 0:
+                        time.sleep(remaining)
+                    continue
                 elif not enabled:
                     with self.lock:
                         self.status = "HOLD"
@@ -715,8 +825,8 @@ class TrackingController:
                             self.command_velocity,
                             self.desired_joint,
                             dt,
-                            self.max_speed,
-                            self.max_accel,
+                            cycle_max_speed,
+                            cycle_max_accel,
                         )
                     if self.status == "RETURNING":
                         at_home = (
@@ -729,26 +839,6 @@ class TrackingController:
                             self.desired_joint = self.preferred_home_position.copy()
                             self.status = "HOME"
                             self.lost_since = None
-                    if self.status == "ROTATING_SCREEN":
-                        joint6_done = (
-                            abs(float(self.command_joint[5] - self.desired_joint[5])) <= 0.01
-                            and abs(float(self.command_velocity[5])) <= 0.02
-                        )
-                        if joint6_done:
-                            rotation_fk = self.robot.forward_kinematics(self.command_joint)
-                            if rotation_fk is None:
-                                raise RuntimeError("J6 旋转后无法计算实际屏幕姿态")
-                            self.screen_rotation = np.asarray(
-                                rotation_fk["rotation"], dtype=np.float64
-                            )
-                            self.preferred_home_position[5] = self.command_joint[5]
-                            self.screen_joint6_target = None
-                            self.smoothed_target = None
-                            self.status = "TRACKING" if fresh and enabled else "HOLD"
-                            print(
-                                f"J6 旋转完成：{self.screen_orientation}；"
-                                "已将实际 FK 姿态设为新的跟随保持姿态。"
-                            )
                     command = self.command_joint.copy()
                     velocity = self.command_velocity.copy()
                     status = self.status
@@ -761,7 +851,7 @@ class TrackingController:
                     ):
                         raise RuntimeError("QP 输出包含非有限关节命令")
                     command = np.clip(command, self.safe_lower, self.safe_upper)
-                    velocity = np.clip(velocity, -self.max_speed, self.max_speed)
+                    velocity = np.clip(velocity, -cycle_max_speed, cycle_max_speed)
                     accepted = self.robot.Joint_Pos_Vel(
                         command.tolist(), velocity.tolist(), self.robot.max_torque.tolist(), iswait=False
                     )
@@ -1121,6 +1211,8 @@ def main() -> int:
     args = parse_args()
     validate_args(args)
     home_position = load_home_position(args.position_file)
+    left_position = load_home_position(args.left_position_file)
+    right_position = load_home_position(args.right_position_file)
     camera_rotation = load_calibration_rotation(args.calibration)
     sdk_scripts = str((REPO_ROOT / "panthera_python" / "scripts").resolve())
     if sdk_scripts not in sys.path:
@@ -1167,7 +1259,8 @@ def main() -> int:
         raise
 
     controller = TrackingController(
-        robot, home_position, camera_rotation, screen_rotation, args
+        robot, home_position, camera_rotation, screen_rotation,
+        left_position, right_position, args
     )
     gesture_args = argparse.Namespace(
         motion_step=args.motion_step,

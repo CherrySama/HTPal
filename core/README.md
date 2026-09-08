@@ -67,8 +67,16 @@ python core/handdetect/src/hand_gesture_test.py --fps 15 --enable-motion
 
 手势事件已接入 `facedetect/src/face_tracking_control.py`。跟踪开启后，
 程序同时检测人脸和手：前后手势切换 `0.4/0.5/0.6 m` 距离档位，左右旋转
-切换 `LANDSCAPE/PORTRAIT_LEFT/PORTRAIT_RIGHT`。旋转阶段只推进 J6；完成后
-读取实际 FK 姿态作为新的屏幕保持姿态，继续做人脸位置跟踪。
+切换 `LANDSCAPE/PORTRAIT_LEFT/PORTRAIT_RIGHT`。面对屏幕时，用户左旋映射为左竖屏，
+用户右旋映射为右竖屏。旋转阶段只推进 J6；完成前不提交新的屏幕姿态，完成后读取
+实际 FK 姿态作为新的屏幕保持姿态，继续做人脸位置跟踪。
+
+旋转增量从三个独立姿态文件计算：`detect_test_pos.md`（横屏）、
+`detect_test_pos_left.md`（左竖屏）和 `detect_test_pos_right.md`（右竖屏）。
+运行时使用“当前实际 J6 + 当前姿态到目标姿态的标定增量”，而不是写死绝对角度。
+
+旋转阶段使用独立的 J6 速度/加速度，不受普通跟踪速度参数限制，可用
+`--screen-rotation-speed` 和 `--screen-rotation-accel` 调整。
 
 建议先观察模式验证画面和事件，不加 `--enable-motion`：
 
