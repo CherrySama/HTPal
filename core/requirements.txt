@@ -1,0 +1,16 @@
+# HTPal 视觉伺服环境的新增依赖。
+# 基础环境建议从 charm_vision 克隆，以保留已验证的 CUDA、YOLO、OpenCV 和 RealSense 栈。
+# 机械臂 SDK 使用项目内 Python 3.12 wheel，安装命令见 core/README.md。
+
+insightface==1.0.1
+onnxruntime-gpu==1.29.0
+onnx==1.22.0
+mediapipe==0.10.35
+opencv-contrib-python==5.0.0.93
+pyrealsense2==2.58.3.10794
+scipy==1.18.1
+scikit-image==0.26.0
+tqdm==4.70.0
+flatbuffers==25.12.19
+nvidia-cublas==13.1.1.3
+nvidia-cudnn-cu13==9.20.0.48

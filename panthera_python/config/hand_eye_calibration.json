@@ -1,0 +1,33 @@
+{
+  "T_tcp_camera": [
+    [
+      0.06485742344192436,
+      -0.32774583437419763,
+      0.9425370988321022,
+      -0.0892675602150106
+    ],
+    [
+      -0.9974170850425397,
+      -0.05050608630127429,
+      0.05107145691843179,
+      0.004825041785322462
+    ],
+    [
+      0.03086540279532951,
+      -0.9434149687687223,
+      -0.3301749893819834,
+      0.06409072416662598
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "timestamp": "2026-02-11 17:43:29",
+  "num_samples": 4,
+  "source": "VisionGrab/Panthera-HT_SDK_my/panthera_python/scripts/hand_eye_calibration.json",
+  "transform_convention": "T_base_camera = T_base_joint6 @ T_joint6_camera",
+  "notes": "原始 VisionGrab 手眼标定。当前安装未发生旋转，运行时使用本矩阵的旋转部分；当前相机平移由 user_following.yaml 中的 link6 +Z 0.16 m 几何约束定义。"
+}

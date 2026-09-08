@@ -203,6 +203,23 @@
      <axis xyz="1 0 0" />
      <limit lower="-2.5" upper="2.5" effort="10" velocity="3.7" />
    </joint>
+  <!--
+    HTPal 屏幕负载近似：总质量约 3 kg，重心位于 link6 +X 方向 25 mm。
+    先按集中质量建模；重力补偿主要使用质量和重心，转动惯量待获得屏幕
+    外形尺寸后再精确标定。该固定 link 不改变 joint6 末端 frame 的定义。
+  -->
+  <link name="screen_payload">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <mass value="3.0" />
+      <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6" />
+    </inertial>
+  </link>
+  <joint name="screen_payload_joint" type="fixed">
+    <origin xyz="0.025 0 0" rpy="0 0 0" />
+    <parent link="link6" />
+    <child link="screen_payload" />
+  </joint>
   <link name="tool_link"/>
   <joint name="tool_joint" type="fixed">
     <parent link="link6"/>

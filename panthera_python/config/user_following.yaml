@@ -1,0 +1,37 @@
+# 用户跟随准备配置
+# 当前文件只描述坐标链和时间伺服参数，不包含人脸检测模型配置。
+
+camera:
+  # VisionGrab 标定矩阵，提供当前相机相对 link6 的旋转关系。
+  hand_eye_calibration_file: "hand_eye_calibration.json"
+  parent_frame: "link6"
+  # 当前相机光学中心相对 link6 原点（屏幕中心）沿 link6 +Z 偏移 16 cm。
+  translation_link6_m: [0.0, 0.0, 0.16]
+  # 当前安装没有发生旋转，复用标定文件中的旋转矩阵。
+  rotation_source: "T_tcp_camera[:3, :3]"
+  use_calibration_translation: false
+  # 深度点使用 RealSense 对齐到彩色图像后的相机坐标系。
+  point_frame: "color_camera"
+
+screen:
+  # 屏幕中心与 link6 旋转轴原点重合。
+  center_link6_m: [0.0, 0.0, 0.0]
+
+time_servo:
+  # 参考 VisionGrab 的 100 Hz 时间伺服循环。
+  control_period_s: 0.01
+  target_timeout_s: 0.50
+  smoothing_alpha: 0.15
+  ik_deadzone_m: 0.010
+  # 目标丢失后不再更新目标，保持最后一个有效关节目标。
+  lost_target_action: "hold"
+
+target:
+  # 用户位置到 joint6 目标位置的 base 坐标偏移，第一版默认为零。
+  position_offset_base_m: [0.0, 0.0, 0.0]
+  # 第一版只跟随位置，保持当前 joint6 姿态。
+  hold_current_orientation: true
+
+runtime:
+  dry_run_default: true
+  send_motor_commands: false
