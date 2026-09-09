@@ -6,10 +6,7 @@ RealSense RGB-D 和 SCRFD 检测。按 ``c`` 切换跟踪，按 ``q`` 或 Ctrl+C
 
 跟踪状态机参考 VisionGrab，但实时跟踪采用速度级 QP；HOME、退出动作和目标几何关系按 HTPal 定义：
 屏幕中心是 link6 原点，屏幕中心与人脸的目标法向距离为 0.5 m，
-屏幕姿态默认保持启动时姿态。MediaPipe 手势只产生离散的距离档位和横/竖屏
-事件；旋转事件在跟踪控制线程内只推进 J6，完成后继续用实际 FK 姿态保持跟随。
-默认补偿上沿相机的切向安装偏移，优先让人脸靠近相机光轴；此时不再要求
-屏幕中心与人脸严格共线。
+动态跟随持续调整屏幕水平偏航以对准人脸；MediaPipe 手势用于切换距离档位和横/竖屏姿态。
 """
 
 from __future__ import annotations
@@ -118,7 +115,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-joint-speed", type=float, default=0.15, help="跟踪最大关节速度（rad/s）")
     parser.add_argument("--max-joint-accel", type=float, default=0.30, help="跟踪最大关节加速度（rad/s²）")
     parser.add_argument("--screen-rotation-speed", type=float, default=0.40, help="屏幕 J6 旋转速度（rad/s）")
-    parser.add_argument("--screen-rotation-accel", type=float, default=0.60, help="屏幕 J6 旋转加速度（rad/s²）")
     parser.add_argument("--qp-position-gain", type=float, default=4.5, help="QP 末端位置反馈增益")
     parser.add_argument("--qp-rotation-gain", type=float, default=4.0, help="QP 末端姿态反馈增益")
     parser.add_argument("--max-cartesian-speed", type=float, default=0.15, help="QP 末端线速度上限（m/s）")
@@ -199,7 +195,6 @@ def validate_args(args: argparse.Namespace) -> None:
         args.max_joint_speed,
         args.max_joint_accel,
         args.screen_rotation_speed,
-        args.screen_rotation_accel,
         args.qp_position_gain,
         args.qp_rotation_gain,
         args.max_cartesian_speed,
@@ -255,7 +250,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def load_home_position(path: Path) -> np.ndarray:
-    """Read six joint positions directly from the HOME markdown file."""
+    """直接解析 HOME markdown，不依赖任何项目内辅助脚本。"""
     values = []
     for line in path.resolve().read_text(encoding="utf-8").splitlines():
         if "位置=" not in line or "rad" not in line:
@@ -345,24 +340,71 @@ def deproject_pixel(center_x: float, center_y: float, depth_m: float, intrinsics
     return np.asarray(point, dtype=np.float64)
 
 
-def detect_faces(detector, color: np.ndarray, depth_frame, intrinsics, args: argparse.Namespace):
-    """Detect faces and attach a depth-backed camera point to each detection."""
-    bboxes, keypoints = detector.detect(color)
+def normalize_face_image(color: np.ndarray, orientation: str) -> np.ndarray:
+    """Rotate portrait camera images upright for face detection only."""
+    if orientation == "PORTRAIT_LEFT":
+        return cv2.rotate(color, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if orientation == "PORTRAIT_RIGHT":
+        return cv2.rotate(color, cv2.ROTATE_90_CLOCKWISE)
+    return color
+
+
+def face_points_to_raw(points: np.ndarray, orientation: str, raw_width: int, raw_height: int) -> np.ndarray:
+    """Map points from the upright detection image back to raw camera pixels."""
+    mapped = np.asarray(points, dtype=np.float64).reshape(-1, 2).copy()
+    x = mapped[:, 0].copy()
+    y = mapped[:, 1].copy()
+    if orientation == "PORTRAIT_LEFT":
+        mapped[:, 0] = raw_width - 1.0 - y
+        mapped[:, 1] = x
+    elif orientation == "PORTRAIT_RIGHT":
+        mapped[:, 0] = y
+        mapped[:, 1] = raw_height - 1.0 - x
+    mapped[:, 0] = np.clip(mapped[:, 0], 0.0, raw_width - 1.0)
+    mapped[:, 1] = np.clip(mapped[:, 1], 0.0, raw_height - 1.0)
+    return mapped
+
+
+def detect_faces(
+    detector,
+    color: np.ndarray,
+    depth_frame,
+    intrinsics,
+    args: argparse.Namespace,
+    orientation: str = "LANDSCAPE",
+):
+    """Detect upright faces, then sample depth in the original camera image."""
+    detection_image = normalize_face_image(color, orientation)
+    bboxes, keypoints = detector.detect(detection_image)
     detections = []
     if bboxes is None:
         return detections
-    image_height, image_width = color.shape[:2]
+    raw_height, raw_width = color.shape[:2]
+    detection_height, detection_width = detection_image.shape[:2]
     for index, bbox in enumerate(bboxes):
         x1, y1, x2, y2, score = [float(value) for value in bbox[:5]]
-        x1 = max(0.0, min(image_width - 1.0, x1))
-        x2 = max(0.0, min(image_width - 1.0, x2))
-        y1 = max(0.0, min(image_height - 1.0, y1))
-        y2 = max(0.0, min(image_height - 1.0, y2))
+        x1 = max(0.0, min(detection_width - 1.0, x1))
+        x2 = max(0.0, min(detection_width - 1.0, x2))
+        y1 = max(0.0, min(detection_height - 1.0, y1))
+        y2 = max(0.0, min(detection_height - 1.0, y2))
+        raw_corners = face_points_to_raw(
+            np.array(((x1, y1), (x2, y1), (x1, y2), (x2, y2)), dtype=np.float64),
+            orientation,
+            raw_width,
+            raw_height,
+        )
+        raw_x1, raw_y1 = np.min(raw_corners, axis=0)
+        raw_x2, raw_y2 = np.max(raw_corners, axis=0)
         if keypoints is not None and index < len(keypoints):
-            points = np.asarray(keypoints[index], dtype=np.float64).reshape(-1, 2)
+            points = face_points_to_raw(
+                keypoints[index], orientation, raw_width, raw_height
+            )
             center_x, center_y = np.mean(points, axis=0)
         else:
-            center_x, center_y = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+            normalized_center = np.array((((x1 + x2) * 0.5, (y1 + y2) * 0.5),))
+            center_x, center_y = face_points_to_raw(
+                normalized_center, orientation, raw_width, raw_height
+            )[0]
             points = None
         depth_m = sample_depth_m(
             depth_frame, center_x, center_y, args.depth_radius, args.min_depth, args.max_depth
@@ -372,7 +414,10 @@ def detect_faces(detector, color: np.ndarray, depth_frame, intrinsics, args: arg
             if depth_m is not None else None
         )
         detections.append({
-            "bbox": (int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))),
+            "bbox": (
+                int(round(raw_x1)), int(round(raw_y1)),
+                int(round(raw_x2)), int(round(raw_y2)),
+            ),
             "center": (float(center_x), float(center_y)),
             "score": score,
             "keypoints": points,
@@ -416,6 +461,12 @@ class TargetGate:
     def __init__(self, confirm_frames: int, max_jump: float):
         self.confirm_frames = int(confirm_frames)
         self.max_jump = float(max_jump)
+        self.accepted = None
+        self.pending = None
+        self.pending_count = 0
+
+    def reset(self) -> None:
+        """Discard points measured in a previous camera orientation."""
         self.accepted = None
         self.pending = None
         self.pending_count = 0
@@ -545,19 +596,15 @@ class TrackingController:
         self.home_position = home_position
         self.preferred_home_position = home_position.copy()
         self.camera_rotation = camera_rotation
-        self.screen_rotation_landscape = np.asarray(screen_rotation, dtype=np.float64).copy()
         self.screen_rotation = np.asarray(screen_rotation, dtype=np.float64).copy()
         self.screen_distance = float(args.screen_distance)
         self.screen_orientation = "LANDSCAPE"
         self.screen_joint6_target = None
         self.pending_screen_orientation = None
-        self.landscape_position = np.asarray(home_position, dtype=np.float64).copy()
-        self.left_position = np.asarray(left_position, dtype=np.float64).copy()
-        self.right_position = np.asarray(right_position, dtype=np.float64).copy()
         calibration_positions = {
-            "LANDSCAPE": self.landscape_position,
-            "PORTRAIT_LEFT": self.left_position,
-            "PORTRAIT_RIGHT": self.right_position,
+            "LANDSCAPE": np.asarray(home_position, dtype=np.float64).copy(),
+            "PORTRAIT_LEFT": np.asarray(left_position, dtype=np.float64).copy(),
+            "PORTRAIT_RIGHT": np.asarray(right_position, dtype=np.float64).copy(),
         }
         if any(
             position.shape != (JOINT_COUNT,) or not np.all(np.isfinite(position))
@@ -565,7 +612,7 @@ class TrackingController:
         ):
             raise ValueError("横屏/左右竖屏标定文件必须各包含六个有效关节位置")
         for orientation, position in calibration_positions.items():
-            if np.max(np.abs(position[:5] - self.landscape_position[:5])) > 0.02:
+            if np.max(np.abs(position[:5] - home_position[:5])) > 0.02:
                 raise ValueError(
                     f"{orientation} 标定姿态的 J1~J5 与横屏 HOME 不一致，不能安全执行 J6-only 旋转"
                 )
@@ -634,8 +681,13 @@ class TrackingController:
                 self.latest_point_camera = np.asarray(point_camera, dtype=np.float64).copy()
                 self.latest_target_time = float(timestamp)
 
+    def clear_target(self) -> None:
+        with self.lock:
+            self.latest_point_camera = None
+            self.latest_target_time = None
+
     def apply_gesture_event(self, event: str, gesture_state: GestureState) -> None:
-        """Apply a discrete distance level or queue a joint6-only rotation."""
+        """Apply a distance step or queue a J6-only screen rotation."""
         with self.lock:
             if self.screen_joint6_target is not None:
                 print(f"手势 {event}：当前屏幕旋转动作未完成，忽略本次事件。")
@@ -649,19 +701,13 @@ class TrackingController:
                 self.smoothed_target = None
                 print(f"手势 {event}：跟随距离切换为 {self.screen_distance:.2f} m")
                 return
-
             orientation = gesture_state.orientation
-            if orientation not in self.calibration_j6:
-                raise ValueError(f"未知屏幕姿态：{orientation}")
-            if self.screen_orientation not in self.calibration_j6:
-                raise ValueError(f"当前屏幕姿态无标定值：{self.screen_orientation}")
+            if orientation not in self.calibration_j6 or self.screen_orientation not in self.calibration_j6:
+                raise ValueError(f"未知屏幕姿态：{orientation} / {self.screen_orientation}")
             actual_q = np.asarray(self.robot.get_current_pos(), dtype=np.float64)
             if actual_q.shape != (JOINT_COUNT,) or not np.all(np.isfinite(actual_q)):
                 raise RuntimeError("无法读取旋转开始时的实际六关节角度")
-            calibration_delta = (
-                self.calibration_j6[orientation]
-                - self.calibration_j6[self.screen_orientation]
-            )
+            calibration_delta = self.calibration_j6[orientation] - self.calibration_j6[self.screen_orientation]
             joint6_target = float(actual_q[5] + calibration_delta)
             if not self.safe_lower[5] <= joint6_target <= self.safe_upper[5]:
                 raise ValueError(
@@ -685,46 +731,27 @@ class TrackingController:
         with self.lock:
             return self.screen_distance, self.screen_orientation
 
-    def snapshot(self) -> tuple[str, bool, float | None]:
-        with self.lock:
-            age = None if self.latest_target_time is None else time.monotonic() - self.latest_target_time
-            return self.status, self.tracking_enabled, age
-
-    def start(self) -> None:
-        self.thread.start()
-
-    def stop(self) -> None:
-        self.stop_event.set()
-        self.thread.join(timeout=2.0)
-
     def _run_rotation_once(self, target_joint6: float, fresh: bool, enabled: bool) -> None:
-        """Execute one blocking J6 move, then return to normal tracking."""
+        """Execute one blocking J6 move and refresh the dynamic pose reference."""
         actual_q = np.asarray(self.robot.get_current_pos(), dtype=np.float64)
         if actual_q.shape != (JOINT_COUNT,) or not np.all(np.isfinite(actual_q)):
             raise RuntimeError("无法读取旋转开始时的实际六关节角度")
         target_q = actual_q.copy()
         target_q[5] = float(target_joint6)
-
         if self.args.enable_motion:
             velocity = [0.0] * JOINT_COUNT
-            velocity[5] = min(
-                float(self.args.screen_rotation_speed),
-                float(getattr(self.robot, "velocity_limits", [1.0] * JOINT_COUNT)[5]),
-            )
+            velocity[5] = min(float(self.args.screen_rotation_speed), float(getattr(self.robot, "velocity_limits", [1.0] * JOINT_COUNT)[5]))
             reached = bool(self.robot.Joint_Pos_Vel(
                 target_q.tolist(), velocity, self.robot.max_torque.tolist(),
                 iswait=True, tolerance=0.02, timeout=10.0,
             ))
             completion_q = np.asarray(self.robot.get_current_pos(), dtype=np.float64)
         else:
-            reached = True
-            completion_q = target_q
-
+            reached, completion_q = True, target_q
         if (
-            not reached
-            or completion_q.shape != (JOINT_COUNT,)
-            or not np.all(np.isfinite(completion_q))
-            or abs(float(completion_q[5] - target_joint6)) > 0.02
+            not reached or completion_q.shape != (JOINT_COUNT,) or
+            not np.all(np.isfinite(completion_q)) or
+            abs(float(completion_q[5] - target_joint6)) > 0.02
         ):
             with self.lock:
                 self.screen_joint6_target = None
@@ -733,12 +760,11 @@ class TrackingController:
                 self.desired_joint = self.command_joint.copy()
                 self.status = "ROTATION_FAILED"
             print(
-                f"J6 旋转失败：目标 {target_joint6:+.3f} rad，"
-                f"实际 {float(completion_q[5]) if completion_q.shape == (JOINT_COUNT,) else float('nan'):+.3f} rad",
+                f"J6 旋转失败：目标 {target_joint6:+.3f} rad，实际 "
+                f"{float(completion_q[5]) if completion_q.shape == (JOINT_COUNT,) else float('nan'):+.3f} rad",
                 file=sys.stderr,
             )
             return
-
         rotation_fk = self.robot.forward_kinematics(completion_q)
         if rotation_fk is None:
             raise RuntimeError("J6 旋转后无法计算屏幕姿态")
@@ -752,6 +778,8 @@ class TrackingController:
             self.cartesian_command_ready = False
             self.cartesian_command_velocity.fill(0.0)
             self.screen_rotation = np.asarray(rotation_fk["rotation"], dtype=np.float64)
+            if hasattr(self, "home_screen_rotation"):
+                self.home_screen_rotation = self.screen_rotation.copy()
             self.preferred_home_position[5] = completion_q[5]
             self.screen_orientation = completed_orientation
             self.pending_screen_orientation = None
@@ -764,10 +792,19 @@ class TrackingController:
             self.limit_hold_reported = False
             self.limit_hold_reason = None
             self.status = "TRACKING" if fresh and enabled else "HOLD"
-        print(
-            f"J6 旋转完成：{self.screen_orientation}；"
-            "已切换为新的固定屏幕姿态并恢复跟随。"
-        )
+        print(f"J6 旋转完成：{self.screen_orientation}；已更新动态姿态参考并恢复跟随。")
+
+    def snapshot(self) -> tuple[str, bool, float | None]:
+        with self.lock:
+            age = None if self.latest_target_time is None else time.monotonic() - self.latest_target_time
+            return self.status, self.tracking_enabled, age
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=2.0)
 
     def _loop(self) -> None:
         previous_time = time.monotonic()
@@ -784,13 +821,6 @@ class TrackingController:
                 screen_joint6_target = self.screen_joint6_target
                 command_joint = self.command_joint.copy()
                 command_velocity = self.command_velocity.copy()
-                cycle_max_speed = self.max_speed.copy()
-                cycle_max_accel = self.max_accel.copy()
-                if screen_joint6_target is not None:
-                    cycle_max_speed[:5] = 0.0
-                    cycle_max_accel[:5] = 0.0
-                    cycle_max_speed[5] = self.args.screen_rotation_speed
-                    cycle_max_accel[5] = self.args.screen_rotation_accel
             fresh = point_camera is not None and target_time is not None and now - target_time <= self.args.target_timeout
 
             try:
@@ -831,8 +861,8 @@ class TrackingController:
                             self.command_velocity,
                             self.desired_joint,
                             dt,
-                            cycle_max_speed,
-                            cycle_max_accel,
+                            self.max_speed,
+                            self.max_accel,
                         )
                     if self.status == "RETURNING":
                         at_home = (
@@ -857,7 +887,7 @@ class TrackingController:
                     ):
                         raise RuntimeError("QP 输出包含非有限关节命令")
                     command = np.clip(command, self.safe_lower, self.safe_upper)
-                    velocity = np.clip(velocity, -cycle_max_speed, cycle_max_speed)
+                    velocity = np.clip(velocity, -self.max_speed, self.max_speed)
                     accepted = self.robot.Joint_Pos_Vel(
                         command.tolist(), velocity.tolist(), self.robot.max_torque.tolist(), iswait=False
                     )
@@ -985,7 +1015,7 @@ class TrackingController:
             velocity_weights[0] = 2.0
             home_weights[0] = 2.5
         qdot_home = np.clip(
-            self.args.qp_home_gain * (self.preferred_home_position - q_command),
+            self.args.qp_home_gain * (self.home_position - q_command),
             -self.args.qp_home_speed,
             self.args.qp_home_speed,
         )
@@ -1006,7 +1036,7 @@ class TrackingController:
             lower[index] = max(lower[index], -self.max_speed[index] * np.clip((q_command[index] - self.safe_lower[index]) / slowdown, 0.0, 1.0))
         # J1 只允许在 HOME 附近的有限范围内工作。到达范围边缘时只冻结
         # 继续远离 HOME 的方向，反向回 HOME 仍然允许。
-        j1_home = float(self.preferred_home_position[0])
+        j1_home = float(self.home_position[0])
         j1_delta = float(q_command[0] - j1_home)
         if j1_delta >= self.args.j1_home_deviation:
             upper[0] = min(upper[0], 0.0)
@@ -1246,9 +1276,7 @@ def main() -> int:
             num_hands=args.num_hands,
             min_detection=args.min_detection,
             min_presence=args.min_presence,
-        min_tracking=args.min_tracking,
-        hand_score_min=args.hand_score_min,
-        palm_depth_spread_max=args.palm_depth_spread_max,
+            min_tracking=args.min_tracking,
         )
         hand_landmarker = create_landmarker(hand_args)
         pipeline, align, intrinsics = initialize_realsense(args)
@@ -1284,8 +1312,6 @@ def main() -> int:
         rotate_trigger=args.rotate_trigger,
         rotate_rearm=args.rotate_rearm,
         rotate_stop_delta=args.rotate_stop_delta,
-        hand_score_min=args.hand_score_min,
-        palm_depth_spread_max=args.palm_depth_spread_max,
     )
     gesture_state = GestureState(gesture_args)
     target_gate = TargetGate(args.confirm_frames, args.max_target_jump)
@@ -1298,6 +1324,7 @@ def main() -> int:
     previous_time = time.perf_counter()
     fps = 0.0
     last_toggle_time = 0.0
+    last_face_orientation = "LANDSCAPE"
     try:
         cv2.namedWindow(DEFAULT_WINDOW, cv2.WINDOW_NORMAL)
         while True:
@@ -1307,8 +1334,18 @@ def main() -> int:
             if not depth_frame or not color_frame:
                 continue
             color = np.asanyarray(color_frame.get_data()).copy()
-            detections = detect_faces(detector, color, depth_frame, intrinsics, args)
             status, enabled, _ = controller.snapshot()
+            _, screen_orientation = controller.gesture_snapshot()
+            if screen_orientation != last_face_orientation:
+                target_gate.reset()
+                controller.clear_target()
+                last_face_orientation = screen_orientation
+            if status == "ROTATING_SCREEN":
+                detections = []
+            else:
+                detections = detect_faces(
+                    detector, color, depth_frame, intrinsics, args, screen_orientation
+                )
             hand_measurement = sample_hand(
                 hand_landmarker,
                 color,
@@ -1320,16 +1357,20 @@ def main() -> int:
             if enabled:
                 for event in events:
                     controller.apply_gesture_event(event, gesture_state)
-            selected = select_nearest_target(detections)
-            accepted_point = target_gate.update(
-                None if selected is None else selected["point_camera"]
-            )
-            controller.update_target(
-                accepted_point,
-                None if accepted_point is None else time.monotonic(),
-            )
             status, enabled, _ = controller.snapshot()
-            screen_distance, screen_orientation = controller.gesture_snapshot()
+            selected = select_nearest_target(detections)
+            if status == "ROTATING_SCREEN":
+                target_gate.reset()
+                controller.clear_target()
+            else:
+                accepted_point = target_gate.update(
+                    None if selected is None else selected["point_camera"]
+                )
+                controller.update_target(
+                    accepted_point,
+                    None if accepted_point is None else time.monotonic(),
+                )
+            status, enabled, _ = controller.snapshot()
             if status == "ERROR":
                 raise RuntimeError("跟踪控制线程已停止，请检查终端中的控制异常")
             now = time.perf_counter()
@@ -1339,6 +1380,7 @@ def main() -> int:
             display_status = status if enabled else "HOLD"
             draw_detections(color, detections, selected, display_status, fps)
             draw_hand(color, hand_measurement)
+            screen_distance, screen_orientation = controller.gesture_snapshot()
             cv2.putText(
                 color,
                 f"screen={screen_distance:.2f}m {screen_orientation} | gesture={gesture_state.status}",
@@ -1367,6 +1409,224 @@ def main() -> int:
         pipeline.stop()
         return_to_zero(robot, args.exit_velocity)
     return 0
+
+
+ORIGINAL_DETECT_FACES = detect_faces
+ORIGINAL_FACE_TO_SCREEN_TARGET = face_to_screen_target
+
+# 动态姿态滤波，避免人脸深度噪声直接变成屏幕角度抖动。
+POSE_FOLLOW_ALPHA = 0.08
+# 只跟随水平偏航；俯仰和滚转保留 HOME，避免深度噪声导致大幅抬头/低头。
+MAX_YAW_OFFSET = math.radians(45.0)
+PITCH_TASK_WEIGHT = 20.0
+YAW_TASK_WEIGHT = 50.0
+ROLL_TASK_WEIGHT = 50.0
+
+def detect_faces_eye_center(
+    detector, color, depth_frame, intrinsics, args, orientation="LANDSCAPE"
+):
+    """复用原检测流程，但将跟踪点改为双眼中心。
+
+    SCRFD 的五个关键点顺序是左右眼、鼻尖、左右嘴角；原版使用五点平均，
+    会让嘴部和鼻尖移动影响屏幕目标。动态试验版只用左右眼中点作为观看目标。
+    """
+    detections = ORIGINAL_DETECT_FACES(
+        detector, color, depth_frame, intrinsics, args, orientation
+    )
+    for item in detections:
+        points = item.get("keypoints")
+        if points is None or np.asarray(points).shape[0] < 2:
+            continue
+        points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        eye_center = 0.5 * (points[0] + points[1])
+        eye_points_camera = []
+        eye_depths = []
+        for eye in points[:2]:
+            depth_m = sample_depth_m(
+                depth_frame,
+                eye[0],
+                eye[1],
+                args.depth_radius,
+                args.min_depth,
+                args.max_depth,
+            )
+            if depth_m is None:
+                continue
+            eye_points_camera.append(deproject_pixel(eye[0], eye[1], depth_m, intrinsics))
+            eye_depths.append(depth_m)
+        point_camera = None
+        if len(eye_points_camera) == 2:
+            # 先分别反投影，再取三维中点；这比在二维中点处只采一个深度更准确。
+            point_camera = np.mean(np.asarray(eye_points_camera, dtype=np.float64), axis=0)
+            depth_m = float(np.mean(eye_depths))
+        else:
+            # 双眼有一个深度无效时，回退到二维中点深度，避免整帧丢失目标。
+            depth_m = sample_depth_m(
+                depth_frame,
+                eye_center[0],
+                eye_center[1],
+                args.depth_radius,
+                args.min_depth,
+                args.max_depth,
+            )
+            if depth_m is not None:
+                point_camera = deproject_pixel(
+                    eye_center[0], eye_center[1], depth_m, intrinsics
+                )
+        item["center"] = (float(eye_center[0]), float(eye_center[1]))
+        item["depth_m"] = depth_m
+        item["point_camera"] = point_camera
+    return detections
+
+
+def same_height_face_to_screen_target(
+    point_camera, fk, camera_rotation, screen_distance, screen_rotation,
+    camera_centering_gain=1.0,
+):
+    """复用原目标几何，但强制屏幕中心与双眼中心同高。"""
+    target = ORIGINAL_FACE_TO_SCREEN_TARGET(
+        point_camera,
+        fk,
+        camera_rotation,
+        screen_distance,
+        screen_rotation,
+        camera_centering_gain,
+    )
+    _, t_base_camera = make_transforms(fk, camera_rotation)
+    eye_h = t_base_camera @ np.append(np.asarray(point_camera, dtype=np.float64), 1.0)
+    target[2] = eye_h[2]
+    return target
+
+
+class DynamicPoseTrackingController(TrackingController):
+    """实时生成“法向指向人脸、HOME 滚转”的屏幕姿态。"""
+
+    def __init__(self, robot, home_position, camera_rotation, screen_rotation, left_position, right_position, args):
+        super().__init__(
+            robot, home_position, camera_rotation, screen_rotation,
+            left_position, right_position, args,
+        )
+        self.home_screen_rotation = np.asarray(screen_rotation, dtype=np.float64).copy()
+
+    def _screen_rotation_toward_face(self, fk: dict, point_camera: np.ndarray):
+        """只根据水平投影调整偏航，俯仰/滚转保持 HOME。"""
+        _, t_base_camera = make_transforms(fk, self.camera_rotation)
+        face_h = t_base_camera @ np.append(np.asarray(point_camera, dtype=np.float64), 1.0)
+        direction = face_h[:3] - np.asarray(fk["position"], dtype=np.float64)
+        vertical = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        face_horizontal = direction - vertical * float(np.dot(direction, vertical))
+        home_normal = self.home_screen_rotation @ np.asarray(self.camera_rotation[:, 2], dtype=np.float64)
+        home_horizontal = home_normal - vertical * float(np.dot(home_normal, vertical))
+        face_norm = float(np.linalg.norm(face_horizontal))
+        home_norm = float(np.linalg.norm(home_horizontal))
+        if not np.isfinite(face_norm) or not np.isfinite(home_norm) or face_norm < 1e-5 or home_norm < 1e-5:
+            return None
+        face_horizontal /= face_norm
+        home_horizontal /= home_norm
+        yaw = math.atan2(
+            float(np.dot(vertical, np.cross(home_horizontal, face_horizontal))),
+            float(np.clip(np.dot(home_horizontal, face_horizontal), -1.0, 1.0)),
+        )
+        yaw = float(np.clip(yaw, -MAX_YAW_OFFSET, MAX_YAW_OFFSET))
+        desired_rotation = Rotation.from_rotvec(vertical * yaw).as_matrix() @ self.home_screen_rotation
+
+        # 在 SO(3) 上做短弧滤波，而不是逐元素插值旋转矩阵。
+        current = np.asarray(self.screen_rotation, dtype=np.float64)
+        relative = Rotation.from_matrix(current.T @ desired_rotation).as_rotvec()
+        return current @ Rotation.from_rotvec(POSE_FOLLOW_ALPHA * relative).as_matrix()
+
+    def _handle_fresh_target(self, point_camera, previous_status, command_joint, command_velocity, dt):
+        actual_q = np.asarray(self.robot.get_current_pos(), dtype=np.float64)
+        if actual_q.shape == (JOINT_COUNT,) and np.all(np.isfinite(actual_q)):
+            fk = self.robot.forward_kinematics(actual_q)
+            if fk is not None:
+                dynamic_rotation = self._screen_rotation_toward_face(fk, point_camera)
+                if dynamic_rotation is not None:
+                    self.screen_rotation = dynamic_rotation
+        return super()._handle_fresh_target(
+            point_camera, previous_status, command_joint, command_velocity, dt
+        )
+
+    def _solve_velocity_qp(self, q_command, qdot_previous, current_fk, desired_twist, dt):
+        """动态姿态版本：位置优先，偏航/滚转较硬，俯仰较软，J4 延后。"""
+        q_command = np.asarray(q_command, dtype=np.float64)
+        qdot_previous = np.asarray(qdot_previous, dtype=np.float64)
+        jacobian = np.asarray(self.robot.get_jacobian(q_command), dtype=np.float64)
+        if jacobian.shape != (6, JOINT_COUNT) or not np.all(np.isfinite(jacobian)):
+            return np.zeros(JOINT_COUNT), "NUMERICAL_FAILURE", 0, np.zeros(JOINT_COUNT, dtype=int)
+
+        # 角速度误差转到当前屏幕局部轴：x≈俯仰，y≈偏航，z≈滚转。
+        current_rotation = np.asarray(current_fk["rotation"], dtype=np.float64)
+        angular_local = current_rotation.T @ np.asarray(desired_twist[3:], dtype=np.float64)
+        angular_scale_local = np.sqrt(np.array(
+            [PITCH_TASK_WEIGHT, YAW_TASK_WEIGHT, ROLL_TASK_WEIGHT], dtype=np.float64
+        ))
+        angular_row = np.diag(angular_scale_local) @ current_rotation.T @ jacobian[3:, :]
+        angular_target = angular_scale_local * angular_local
+        position_scale = np.sqrt(np.full(3, 100.0, dtype=np.float64))
+        rows = [
+            np.diag(position_scale) @ jacobian[:3, :],
+            angular_row,
+            np.diag(np.sqrt(np.array([0.35, 0.6, 0.6, 1.5, 1.5, 1.5]))),
+            np.diag(np.sqrt(np.array([0.18, 0.8, 0.8, 8.0, 6.0, 6.0]))),
+            np.diag(np.sqrt(np.array([0.0, 1.0, 1.0, 8.0, 6.0, 6.0]))),
+        ]
+        targets = [
+            position_scale * np.asarray(desired_twist[:3], dtype=np.float64),
+            angular_target,
+            np.sqrt(np.array([0.35, 0.6, 0.6, 1.5, 1.5, 1.5])) * qdot_previous,
+            np.zeros(JOINT_COUNT),
+            np.sqrt(np.array([0.0, 1.0, 1.0, 8.0, 6.0, 6.0])) * np.clip(
+                self.args.qp_home_gain * (self.preferred_home_position - q_command),
+                -self.args.qp_home_speed,
+                self.args.qp_home_speed,
+            ),
+        ]
+        hessian, gradient = build_least_squares_qp(rows, targets)
+
+        dt = float(np.clip(dt, 1e-4, 0.05))
+        lower = np.maximum(-self.max_speed, qdot_previous - self.max_accel * dt)
+        upper = np.minimum(self.max_speed, qdot_previous + self.max_accel * dt)
+        position_lower = (self.safe_lower - q_command) / dt
+        position_upper = (self.safe_upper - q_command) / dt
+        lower = np.maximum(lower, position_lower)
+        upper = np.minimum(upper, position_upper)
+        slowdown = self.args.qp_slowdown_distance
+        for index in range(JOINT_COUNT):
+            upper[index] = min(
+                upper[index],
+                self.max_speed[index] * np.clip(
+                    (self.safe_upper[index] - q_command[index]) / slowdown, 0.0, 1.0
+                ),
+            )
+            lower[index] = max(
+                lower[index],
+                -self.max_speed[index] * np.clip(
+                    (q_command[index] - self.safe_lower[index]) / slowdown, 0.0, 1.0
+                ),
+            )
+
+        # J1 的 HOME 角度不再作为左右运动的回拉目标；仅保留有限工作范围。
+        j1_delta = float(q_command[0] - self.preferred_home_position[0])
+        if j1_delta >= self.args.j1_home_deviation:
+            upper[0] = min(upper[0], 0.0)
+        elif j1_delta <= -self.args.j1_home_deviation:
+            lower[0] = max(lower[0], 0.0)
+        if np.any(lower > upper + 1e-9):
+            lower = np.minimum(lower, 0.0)
+            upper = np.maximum(upper, 0.0)
+
+        qdot, status, iterations, active = solve_bounded_qp(hessian, gradient, lower, upper)
+        position_active = np.zeros(JOINT_COUNT, dtype=int)
+        position_active[(active == -1) & (qdot <= position_lower + 1e-7)] = -1
+        position_active[(active == 1) & (qdot >= position_upper - 1e-7)] = 1
+        return qdot, status, iterations, position_active
+
+
+# 独立动态姿态入口：不导入带手势的控制文件，也不加载旧辅助脚本。
+detect_faces = detect_faces_eye_center
+face_to_screen_target = same_height_face_to_screen_target
+TrackingController = DynamicPoseTrackingController
 
 
 if __name__ == "__main__":
