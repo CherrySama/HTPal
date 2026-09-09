@@ -52,11 +52,6 @@ trajectory_*.jsonl
 sin_trajectory_tracking.png
 hdf5_joint_tracking_*.png
 
-# Local model weights (keep on disk, do not commit)
-core/facedetect/model/models/**/*.onnx
-core/facedetect/model/models/*.zip
-core/handdetect/model/*.task
-
 # Editors and operating systems
 .vscode/
 .idea/

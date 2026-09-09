@@ -1,0 +1,16 @@
+# HTPal 根目录依赖汇总
+#
+# 从仓库根目录安装：
+#   python -m pip install -r requirements.txt
+#
+# 视觉模块依赖（InsightFace、ONNX Runtime、MediaPipe、RealSense 等）
+-r core/requirements.txt
+
+# 机械臂高层库依赖（PyYAML、Pinocchio、SciPy 等）
+-r panthera_python/requirements.txt
+
+# Panthera-HT 底层 SDK 的 wheel 按 Python 版本和 CPU 架构提供。
+# pip 会从仓库内的 motor_whl 目录自动选择当前环境兼容的 wheel；
+# 如果没有匹配文件，请按 panthera_python/README.md 手动选择并安装。
+--find-links ./panthera_python/motor_whl
+hightorque_robot>=1.0.0
