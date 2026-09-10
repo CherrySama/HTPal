@@ -6,20 +6,17 @@ RealSense RGB-D 和 SCRFD 检测。按 ``c`` 切换跟踪，按 ``q`` 或 Ctrl+C
 
 跟踪状态机参考 VisionGrab，但实时跟踪采用速度级 QP；HOME、退出动作和目标几何关系按 HTPal 定义：
 屏幕中心是 link6 原点，屏幕中心与人脸的目标法向距离为 0.5 m，
-动态试验入口只跟踪人脸，不加载手势识别；屏幕姿态由 InsightFace 三维人脸姿态驱动。
+动态试验入口只跟踪人脸，不加载手势识别；水平偏航连续跟随，半躺时切换固定俯视档。
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
-import io
 import json
 import math
 import sys
 import threading
 import time
-from types import SimpleNamespace
 from pathlib import Path
 
 import cv2
@@ -43,7 +40,6 @@ DEFAULT_MODEL = (
     / "buffalo_sc"
     / "det_500m.onnx"
 )
-DEFAULT_POSE_MODEL = REPO_ROOT / "core" / "facedetect" / "model" / "models" / "landmark_3d_68.onnx"
 DEFAULT_POSITION_FILE = REPO_ROOT / "core" / "detect_test_pos.md"
 DEFAULT_CONFIG_FILE = REPO_ROOT / "panthera_python" / "robot_param" / "Follower_tracking.yaml"
 DEFAULT_CALIBRATION_FILE = REPO_ROOT / "panthera_python" / "config" / "hand_eye_calibration.json"
@@ -65,10 +61,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--det-size", type=int, default=640)
     parser.add_argument("--det-thresh", type=float, default=0.5)
-    parser.add_argument("--pose-model", type=Path, default=DEFAULT_POSE_MODEL, help="InsightFace landmark_3d_68 ONNX 模型")
-    parser.add_argument("--pose-alpha", type=float, default=0.08, help="脸部姿态 SO(3) 滤波系数")
-    parser.add_argument("--pose-deadzone", type=float, default=1.0, help="脸部姿态死区（度）")
-    parser.add_argument("--pose-timeout", type=float, default=0.5, help="脸部姿态数据有效时间（秒）")
+    parser.add_argument("--recline-pitch-angle", type=float, default=20.0, help="半躺档固定向下俯视角（度）")
+    parser.add_argument("--recline-enter-pitch", type=float, default=15.0, help="进入半躺档所需的相对脸部俯仰（度）")
+    parser.add_argument("--recline-height-drop", type=float, default=0.08, help="辅助确认半躺的双眼下降量（米）")
+    parser.add_argument("--recline-exit-height", type=float, default=0.04, help="退出半躺档的双眼下降量滞回阈值（米）")
+    parser.add_argument("--recline-enter-hold", type=float, default=0.5, help="进入半躺档的条件保持时间（秒）")
+    parser.add_argument("--recline-exit-hold", type=float, default=0.7, help="退出半躺档的条件保持时间（秒）")
+    parser.add_argument("--recline-baseline-frames", type=int, default=20, help="正常坐姿基准采样帧数")
+    parser.add_argument("--recline-pose-alpha", type=float, default=0.12, help="脸部俯仰低通滤波系数")
+    parser.add_argument("--recline-transition-time", type=float, default=1.5, help="正常与半躺模式的名义过渡时间（秒）")
+    parser.add_argument("--recline-transition-timeout", type=float, default=4.0, help="模式过渡等待机械臂追赶的最长时间（秒）")
+    parser.add_argument("--transition-joint-error", type=float, default=0.03, help="开始放慢模式过渡的软件/实际关节误差（rad）")
+    parser.add_argument("--transition-governor-tau", type=float, default=0.15, help="自适应进度速度的平滑时间常数（秒）")
+    parser.add_argument("--hold-horizontal-enter", type=float, default=0.04, help="离开 HOLD 的水平误差（米）")
+    parser.add_argument("--hold-horizontal-exit", type=float, default=0.02, help="进入 HOLD 的水平误差（米）")
+    parser.add_argument("--hold-vertical-enter", type=float, default=0.05, help="离开 HOLD 的垂直误差（米）")
+    parser.add_argument("--hold-vertical-exit", type=float, default=0.025, help="进入 HOLD 的垂直误差（米）")
+    parser.add_argument("--hold-distance-enter", type=float, default=0.05, help="离开 HOLD 的距离误差（米）")
+    parser.add_argument("--hold-distance-exit", type=float, default=0.025, help="进入 HOLD 的距离误差（米）")
+    parser.add_argument("--hold-yaw-enter", type=float, default=4.0, help="离开 HOLD 的水平偏航误差（度）")
+    parser.add_argument("--hold-yaw-exit", type=float, default=2.0, help="进入 HOLD 的水平偏航误差（度）")
+    parser.add_argument("--hold-blend-time", type=float, default=0.20, help="FOLLOW/HOLD 控制增益过渡时间（秒）")
+    parser.add_argument(
+        "--recline-pitch-sign",
+        type=float,
+        choices=(-1.0, 1.0),
+        default=1.0,
+        help="半躺方向的脸部俯仰符号；现场方向相反时设为 -1",
+    )
+    parser.add_argument("--pose-max-reprojection-error", type=float, default=8.0, help="五点 PnP 最大重投影均方根误差（像素）")
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--screen-distance", type=float, default=0.5, help="屏幕中心到人脸的目标法向距离（米，非欧氏距离）")
     parser.add_argument(
@@ -82,16 +103,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-timeout", type=float, default=0.5, help="目标数据有效时间（秒）")
     parser.add_argument("--lost-timeout", type=float, default=2.0, help="进入返回 HOME 的连续丢失时间（秒）")
     parser.add_argument("--control-period", type=float, default=0.01, help="控制周期（秒）")
-    parser.add_argument(
-        "--cartesian-step", type=float, default=0.002,
-        help="tracking 每周期允许推进的笛卡尔步长（米，默认 0.002）",
-    )
-    parser.add_argument("--max-joint-speed", type=float, default=0.15, help="跟踪最大关节速度（rad/s）")
-    parser.add_argument("--max-joint-accel", type=float, default=0.30, help="跟踪最大关节加速度（rad/s²）")
+    parser.add_argument("--max-joint-speed", type=float, default=0.22, help="跟踪最大关节速度（rad/s）")
+    parser.add_argument("--max-joint-accel", type=float, default=0.50, help="跟踪最大关节加速度（rad/s²）")
     parser.add_argument("--qp-position-gain", type=float, default=4.5, help="QP 末端位置反馈增益")
     parser.add_argument("--qp-rotation-gain", type=float, default=4.0, help="QP 末端姿态反馈增益")
-    parser.add_argument("--max-cartesian-speed", type=float, default=0.15, help="QP 末端线速度上限（m/s）")
-    parser.add_argument("--max-angular-speed", type=float, default=0.50, help="QP 末端角速度上限（rad/s）")
+    parser.add_argument("--qp-jerk-weight", type=float, default=1.0, help="QP 关节速度变化连续性权重")
+    parser.add_argument("--max-cartesian-speed", type=float, default=0.20, help="QP 末端线速度上限（m/s）")
+    parser.add_argument("--max-angular-speed", type=float, default=0.65, help="QP 末端角速度上限（rad/s）")
     parser.add_argument("--qp-home-gain", type=float, default=0.8, help="QP HOME 构型偏好增益")
     parser.add_argument("--qp-home-speed", type=float, default=0.05, help="回 HOME 偏好速度上限（rad/s）")
     parser.add_argument("--j1-home-deviation", type=float, default=0.75, help="J1 相对 HOME 的最大偏离范围（rad）")
@@ -104,25 +122,6 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help="跟踪时在每个关节限位前预留的安全余量（rad）",
     )
-    parser.add_argument(
-        "--limit-release-hysteresis",
-        type=float,
-        default=0.03,
-        help="法向 LIMIT_HOLD 解除所需的反向位移滞回（米）",
-    )
-    parser.add_argument(
-        "--ik-eps",
-        type=float,
-        default=0.03,
-        help="固定 link6 姿态 IK 的可接受综合误差（默认：0.03，约厘米级）",
-    )
-    parser.add_argument(
-        "--cartesian-ik-eps",
-        type=float,
-        default=0.0005,
-        help="笛卡尔小步 IK 的严格收敛误差（米，默认 0.0005）",
-    )
-    parser.add_argument("--ik-deadzone", type=float, default=0.01, help="重新求 IK 的目标位移死区（米）")
     parser.add_argument("--depth-radius", type=int, default=3, help="深度中值采样半径（像素）")
     parser.add_argument("--min-depth", type=float, default=0.08, help="有效深度下限（米）")
     parser.add_argument("--max-depth", type=float, default=2.0, help="有效深度上限（米）")
@@ -135,7 +134,6 @@ def validate_args(args: argparse.Namespace) -> None:
     """Validate files, dimensions, and safety limits."""
     for path, label in (
         (args.model, "SCRFD 模型"),
-        (args.pose_model, "InsightFace 姿态模型"),
         (args.position_file, "HOME 位置文件"),
         (args.config, "机械臂配置"),
         (args.calibration, "手眼标定文件"),
@@ -146,14 +144,29 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("图像尺寸、帧率和 det-size 必须大于 0")
     if not 0.0 <= args.det_thresh <= 1.0:
         raise ValueError("--det-thresh 必须位于 [0, 1] 范围内")
-    if not 0.0 < args.pose_alpha <= 1.0 or args.pose_deadzone < 0.0:
-        raise ValueError("pose-alpha 必须位于 (0, 1]，pose-deadzone 不能为负数")
     if not 0.0 <= args.camera_centering_gain <= 1.0:
         raise ValueError("--camera-centering-gain 必须位于 [0, 1] 范围内")
     if args.warmup < 0 or args.depth_radius < 0:
         raise ValueError("--warmup 和 --depth-radius 不能为负数")
     if args.confirm_frames <= 0:
         raise ValueError("--confirm-frames 必须大于 0")
+    if args.recline_baseline_frames <= 0:
+        raise ValueError("--recline-baseline-frames 必须大于 0")
+    if not 0.0 < args.recline_pose_alpha <= 1.0:
+        raise ValueError("--recline-pose-alpha 必须位于 (0, 1]")
+    if args.recline_pitch_angle > 45.0:
+        raise ValueError("--recline-pitch-angle 首版限制为不超过 45 度")
+    if args.recline_enter_pitch > 60.0:
+        raise ValueError("半躺进入脸部俯仰阈值不能超过 60 度")
+    if args.recline_exit_height >= args.recline_height_drop:
+        raise ValueError("--recline-exit-height 必须小于 --recline-height-drop 以形成滞回")
+    if args.recline_transition_timeout <= args.recline_transition_time:
+        raise ValueError("--recline-transition-timeout 必须大于名义过渡时间")
+    for axis in ("horizontal", "vertical", "distance", "yaw"):
+        enter = getattr(args, f"hold_{axis}_enter")
+        exit_value = getattr(args, f"hold_{axis}_exit")
+        if exit_value >= enter:
+            raise ValueError(f"--hold-{axis}-exit 必须小于对应 enter 阈值")
     if min(
         args.screen_distance,
         args.target_timeout,
@@ -163,6 +176,7 @@ def validate_args(args: argparse.Namespace) -> None:
         args.max_joint_accel,
         args.qp_position_gain,
         args.qp_rotation_gain,
+        args.qp_jerk_weight,
         args.max_cartesian_speed,
         args.max_angular_speed,
         args.qp_home_gain,
@@ -171,27 +185,37 @@ def validate_args(args: argparse.Namespace) -> None:
         args.j1_horizontal_threshold,
         args.qp_slowdown_distance,
         args.tracking_rebase_threshold,
-        args.limit_release_hysteresis,
-        args.ik_eps,
-        args.cartesian_ik_eps,
-        args.ik_deadzone,
         args.min_depth,
         args.max_depth,
         args.home_velocity,
         args.exit_velocity,
         args.max_target_jump,
-        args.cartesian_step,
-        args.pose_timeout,
+        args.recline_pitch_angle,
+        args.recline_enter_pitch,
+        args.recline_height_drop,
+        args.recline_exit_height,
+        args.recline_enter_hold,
+        args.recline_exit_hold,
+        args.recline_transition_time,
+        args.recline_transition_timeout,
+        args.transition_joint_error,
+        args.transition_governor_tau,
+        args.hold_horizontal_enter,
+        args.hold_horizontal_exit,
+        args.hold_vertical_enter,
+        args.hold_vertical_exit,
+        args.hold_distance_enter,
+        args.hold_distance_exit,
+        args.hold_yaw_enter,
+        args.hold_yaw_exit,
+        args.hold_blend_time,
+        args.pose_max_reprojection_error,
     ) <= 0.0:
         raise ValueError("距离、时间和速度/加速度参数必须大于 0")
     if args.joint_limit_margin < 0.0:
         raise ValueError("--joint-limit-margin 不能为负数")
     if args.min_depth >= args.max_depth:
         raise ValueError("--min-depth 必须小于 --max-depth")
-    if args.cartesian_ik_eps > args.ik_eps:
-        raise ValueError("--cartesian-ik-eps 不应大于 --ik-eps")
-
-
 def load_home_position(path: Path) -> np.ndarray:
     """直接解析 HOME markdown，不依赖任何项目内辅助脚本。"""
     values = []
@@ -238,41 +262,6 @@ def load_detector(model_path: Path, det_size: int, det_thresh: float):
     selected = "CUDAExecutionProvider" if ctx_id == 0 else "CPUExecutionProvider"
     print(f"SCRFD provider：{selected}；模型：{model_path}")
     return detector
-
-
-def load_pose_model(model_path: Path):
-    """Load InsightFace landmark_3d_68, which exposes face['pose']."""
-    available = ort.get_available_providers()
-    providers = [
-        provider
-        for provider in ("CUDAExecutionProvider", "CPUExecutionProvider")
-        if provider in available
-    ]
-    if not providers:
-        raise RuntimeError(f"ONNX Runtime 没有可用的 CUDA/CPU provider：{available}")
-    model = get_model(str(model_path), providers=providers)
-    if model is None or getattr(model, "taskname", "") != "landmark_3d_68":
-        raise RuntimeError(f"姿态模型必须是 landmark_3d_68：{model_path}")
-    ctx_id = 0 if "CUDAExecutionProvider" in providers else -1
-    model.prepare(ctx_id=ctx_id)
-    selected = "CUDAExecutionProvider" if ctx_id == 0 else "CPUExecutionProvider"
-    print(f"InsightFace 姿态 provider：{selected}；模型：{model_path}")
-    return model
-
-
-def estimate_face_pose(pose_model, color: np.ndarray, detection: dict) -> np.ndarray | None:
-    """Estimate [pitch, yaw, roll] degrees for the selected SCRFD face."""
-    face = SimpleNamespace(bbox=np.asarray(detection["bbox"], dtype=np.float32))
-    try:
-        pose_model.get(color, face)
-    except Exception as exc:
-        print(f"InsightFace 姿态估计失败：{exc}", file=sys.stderr)
-        return None
-    pose = getattr(face, "pose", None)
-    if pose is None:
-        return None
-    pose = np.asarray(pose, dtype=np.float64).reshape(-1)
-    return pose if pose.shape == (3,) and np.all(np.isfinite(pose)) else None
 
 
 def report_joint_safety_margin(robot, home_position: np.ndarray, margin: float) -> None:
@@ -427,26 +416,65 @@ class TargetGate:
         return None
 
 
-def step_joint_profile(command_joint, command_velocity, target_joint, dt, max_speed, max_accel):
-    """VisionGrab-style velocity/acceleration-limited joint profile step."""
-    command_joint = np.asarray(command_joint, dtype=np.float64)
-    command_velocity = np.asarray(command_velocity, dtype=np.float64)
-    target_joint = np.asarray(target_joint, dtype=np.float64)
-    dt = float(np.clip(dt, 1e-4, 0.05))
-    error = target_joint - command_joint
-    braking_speed = np.sqrt(2.0 * max_accel * np.abs(error))
-    desired_velocity = np.sign(error) * np.minimum(max_speed, braking_speed)
-    velocity_step = np.clip(desired_velocity - command_velocity, -max_accel * dt, max_accel * dt)
-    next_velocity = command_velocity + velocity_step
-    next_joint = command_joint + next_velocity * dt
-    # 离散积分可能在目标附近越过关节目标，直接钳制避免把 1e-3 rad
-    # 级别的数值 overshoot 发送给 SDK 后触发原始限位拒绝。
-    crossed = (
-        (target_joint - command_joint) * (target_joint - next_joint) <= 0.0
-    )
-    next_joint = np.where(crossed, target_joint, next_joint)
-    next_velocity = np.where(crossed, 0.0, next_velocity)
-    return next_joint, next_velocity
+class SynchronizedJointTrajectory:
+    """所有关节共享一个七次平滑进度的点到点轨迹。"""
+
+    # s(u)=35u^4-84u^5+70u^6-20u^7 的归一化峰值。
+    PEAK_NORMALIZED_SPEED = 2.1875
+    PEAK_NORMALIZED_ACCEL = 7.5131884044
+
+    def __init__(
+        self,
+        start_joint: np.ndarray,
+        target_joint: np.ndarray,
+        max_speed: np.ndarray,
+        max_accel: np.ndarray,
+        minimum_duration: float,
+    ):
+        self.start_joint = np.asarray(start_joint, dtype=np.float64).reshape(-1).copy()
+        self.target_joint = np.asarray(target_joint, dtype=np.float64).reshape(-1).copy()
+        speed = np.asarray(max_speed, dtype=np.float64).reshape(-1)
+        accel = np.asarray(max_accel, dtype=np.float64).reshape(-1)
+        if not (
+            self.start_joint.shape == self.target_joint.shape == speed.shape == accel.shape
+            and np.all(np.isfinite(self.start_joint))
+            and np.all(np.isfinite(self.target_joint))
+            and np.all(np.isfinite(speed))
+            and np.all(np.isfinite(accel))
+            and np.all(speed > 0.0)
+            and np.all(accel > 0.0)
+        ):
+            raise ValueError("同步关节轨迹输入无效")
+        self.delta = self.target_joint - self.start_joint
+        abs_delta = np.abs(self.delta)
+        speed_duration = float(np.max(
+            self.PEAK_NORMALIZED_SPEED * abs_delta / speed
+        ))
+        accel_duration = float(np.max(np.sqrt(
+            self.PEAK_NORMALIZED_ACCEL * abs_delta / accel
+        )))
+        self.duration = max(float(minimum_duration), speed_duration, accel_duration)
+
+    def sample(self, elapsed: float) -> tuple[np.ndarray, np.ndarray, bool]:
+        """返回当前关节位置、速度及轨迹是否完成。"""
+        if elapsed <= 0.0:
+            return self.start_joint.copy(), np.zeros_like(self.start_joint), False
+        if elapsed >= self.duration:
+            return self.target_joint.copy(), np.zeros_like(self.target_joint), True
+        u = float(elapsed / self.duration)
+        u2 = u * u
+        u3 = u2 * u
+        u4 = u3 * u
+        u5 = u4 * u
+        u6 = u5 * u
+        u7 = u6 * u
+        progress = 35.0 * u4 - 84.0 * u5 + 70.0 * u6 - 20.0 * u7
+        progress_rate = (
+            140.0 * u3 - 420.0 * u4 + 420.0 * u5 - 140.0 * u6
+        ) / self.duration
+        position = self.start_joint + progress * self.delta
+        velocity = progress_rate * self.delta
+        return position, velocity, False
 
 
 def make_transforms(fk: dict, camera_rotation: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -525,17 +553,14 @@ class TrackingController:
         self.status = "HOLD"
         self.command_joint = np.asarray(robot.get_current_pos(), dtype=np.float64)
         self.command_velocity = np.zeros(JOINT_COUNT, dtype=np.float64)
+        self.qdot_previous_previous = np.zeros(JOINT_COUNT, dtype=np.float64)
         self.cartesian_command_ready = False
         self.cartesian_command_velocity = np.zeros(JOINT_COUNT, dtype=np.float64)
         self.desired_joint = self.command_joint.copy()
-        self.last_ik_target = None
         self.smoothed_target = None
         self.lost_since = None
-        self.normal_saturation = None
-        self.normal_saturation_direction = 0.0
-        self.limit_hold_reported = False
-        self.limit_hold_reason = None
-        self.last_ik_failure = None
+        self.return_trajectory = None
+        self.return_elapsed = 0.0
         self.last_ik_report_time = 0.0
         self.thread = threading.Thread(target=self._loop, name="htpal-tracking-control", daemon=True)
         configured_limits = np.asarray(getattr(robot, "velocity_limits", [1.0] * JOINT_COUNT), dtype=np.float64)
@@ -556,15 +581,13 @@ class TrackingController:
     def set_tracking_enabled(self, enabled: bool) -> None:
         with self.lock:
             self.tracking_enabled = bool(enabled)
-            self.last_ik_target = None
             self.cartesian_command_ready = False
             self.cartesian_command_velocity.fill(0.0)
+            self.qdot_previous_previous.fill(0.0)
             self.smoothed_target = None
             self.lost_since = None
-            self.normal_saturation = None
-            self.normal_saturation_direction = 0.0
-            self.limit_hold_reported = False
-            self.limit_hold_reason = None
+            self.return_trajectory = None
+            self.return_elapsed = 0.0
             if not enabled:
                 self.desired_joint = self.command_joint.copy()
                 self.status = "HOLD"
@@ -610,10 +633,14 @@ class TrackingController:
                         self.desired_joint = self.command_joint.copy()
                         self.cartesian_command_ready = False
                         self.cartesian_command_velocity.fill(0.0)
-                        self.last_ik_target = None
+                        self.qdot_previous_previous.fill(0.0)
                         self.smoothed_target = None
                         self.lost_since = None
                 elif fresh:
+                    if status == "RETURNING":
+                        with self.lock:
+                            self.return_trajectory = None
+                            self.return_elapsed = 0.0
                     self._handle_fresh_target(
                         point_camera, status, command_joint, command_velocity, dt
                     )
@@ -623,32 +650,37 @@ class TrackingController:
                 with self.lock:
                     if self.status == "RETURNING" and fresh:
                         self.status = "TRACKING"
+                    qp_command_applied = False
                     if self.cartesian_command_ready and fresh and self.status in (
                         "TRACKING", "TRACKING_LIMITED", "QP_FAIL", "REBASE"
                     ):
                         self.command_joint = self.desired_joint.copy()
                         self.command_velocity = self.cartesian_command_velocity.copy()
+                        self.qdot_previous_previous = command_velocity.copy()
                         self.cartesian_command_ready = False
-                    else:
-                        self.command_joint, self.command_velocity = step_joint_profile(
+                        qp_command_applied = True
+                    if self.status == "RETURNING":
+                        if self.return_trajectory is None:
+                            raise RuntimeError("RETURNING 状态缺少同步关节轨迹")
+                        self.return_elapsed += float(np.clip(dt, 1e-4, 0.05))
+                        (
                             self.command_joint,
                             self.command_velocity,
-                            self.desired_joint,
-                            dt,
-                            self.max_speed,
-                            self.max_accel,
-                        )
-                    if self.status == "RETURNING":
-                        at_home = (
-                            np.max(np.abs(self.command_joint - self.home_position)) <= 0.01
-                            and np.max(np.abs(self.command_velocity)) <= 0.02
-                        )
-                        if at_home:
+                            return_complete,
+                        ) = self.return_trajectory.sample(self.return_elapsed)
+                        self.desired_joint = self.home_position.copy()
+                        if return_complete:
                             self.command_joint = self.home_position.copy()
                             self.command_velocity.fill(0.0)
+                            self.qdot_previous_previous.fill(0.0)
                             self.desired_joint = self.home_position.copy()
+                            self.return_trajectory = None
+                            self.return_elapsed = 0.0
                             self.status = "HOME"
                             self.lost_since = None
+                    elif not qp_command_applied:
+                        self.command_joint = self.desired_joint.copy()
+                        self.command_velocity.fill(0.0)
                     command = self.command_joint.copy()
                     velocity = self.command_velocity.copy()
                     status = self.status
@@ -697,6 +729,7 @@ class TrackingController:
                 self.desired_joint = rebased.copy()
                 self.command_velocity = np.zeros(JOINT_COUNT, dtype=np.float64)
                 self.cartesian_command_velocity = np.zeros(JOINT_COUNT, dtype=np.float64)
+                self.qdot_previous_previous.fill(0.0)
                 self.cartesian_command_ready = True
                 self.status = "REBASE"
             if time.monotonic() - self.last_ik_report_time >= 1.0:
@@ -707,32 +740,20 @@ class TrackingController:
         command_fk = self.robot.forward_kinematics(command_joint)
         if actual_fk is None or command_fk is None:
             raise RuntimeError("无法计算当前 link6 正运动学")
-        raw_target = face_to_screen_target(
+        raw_target = self._face_target(
             point_camera,
             actual_fk,
-            self.camera_rotation,
-            self.args.screen_distance,
-            self.screen_rotation,
-            self.args.camera_centering_gain,
         )
         with self.lock:
             if previous_status == "RETURNING":
-                self.last_ik_target = None
                 self.smoothed_target = None
-                self.normal_saturation = None
-                self.normal_saturation_direction = 0.0
-                self.limit_hold_reported = False
-                self.limit_hold_reason = None
-            if self.smoothed_target is None:
-                self.smoothed_target = raw_target.copy()
-            else:
-                alpha = 0.12
-                self.smoothed_target = alpha * raw_target + (1.0 - alpha) * self.smoothed_target
+            self.smoothed_target = self._smooth_face_target(raw_target)
 
             target_position = self.smoothed_target.copy()
             desired_twist = self._desired_twist(command_fk, target_position)
             qdot, solver_status, _, active = self._solve_velocity_qp(
-                command_joint, command_velocity, command_fk, desired_twist, dt
+                command_joint, command_velocity, self.qdot_previous_previous,
+                command_fk, desired_twist, dt
             )
             if solver_status == "SOLVED":
                 qdot = np.asarray(qdot, dtype=np.float64)
@@ -740,6 +761,7 @@ class TrackingController:
                 q_next = np.clip(q_next, self.safe_lower, self.safe_upper)
                 self.desired_joint = q_next
                 self.cartesian_command_velocity = qdot
+                self.qdot_previous_previous = command_velocity.copy()
                 self.cartesian_command_ready = True
                 self.status = "TRACKING_LIMITED" if np.any(active != 0) else "TRACKING"
             else:
@@ -751,6 +773,26 @@ class TrackingController:
                     print(f"速度级 QP 求解失败（{solver_status}），已减速保持当前位置。", file=sys.stderr)
                     self.last_ik_report_time = time.monotonic()
             self.lost_since = None
+
+    def _face_target(self, point_camera: np.ndarray, fk: dict) -> np.ndarray:
+        """根据当前控制器模式计算屏幕中心目标。"""
+        return face_to_screen_target(
+            point_camera,
+            fk,
+            self.camera_rotation,
+            self.args.screen_distance,
+            self.screen_rotation,
+            self.args.camera_centering_gain,
+        )
+
+    def _smooth_face_target(self, raw_target: np.ndarray) -> np.ndarray:
+        if self.smoothed_target is None:
+            return np.asarray(raw_target, dtype=np.float64).copy()
+        alpha = 0.12
+        return (
+            alpha * np.asarray(raw_target, dtype=np.float64)
+            + (1.0 - alpha) * self.smoothed_target
+        )
 
     def _desired_twist(self, current_fk: dict, target_position: np.ndarray) -> np.ndarray:
         current_position = np.asarray(current_fk["position"], dtype=np.float64)
@@ -766,7 +808,10 @@ class TrackingController:
             angular *= self.args.max_angular_speed / angular_norm
         return np.concatenate((linear, angular))
 
-    def _solve_velocity_qp(self, q_command, qdot_previous, current_fk, desired_twist, dt):
+    def _solve_velocity_qp(
+        self, q_command, qdot_previous, qdot_previous_previous,
+        current_fk, desired_twist, dt,
+    ):
         jacobian = np.asarray(self.robot.get_jacobian(q_command), dtype=np.float64)
         if jacobian.shape != (6, JOINT_COUNT) or not np.all(np.isfinite(jacobian)):
             return np.zeros(JOINT_COUNT), "NUMERICAL_FAILURE", 0, np.zeros(JOINT_COUNT, dtype=int)
@@ -829,138 +874,6 @@ class TrackingController:
         position_active[(active == 1) & (qdot >= position_upper - 1e-7)] = 1
         return qdot, status, iterations, position_active
 
-    def _report_limit_hold(
-        self,
-        joint_position: np.ndarray,
-        requested_target: np.ndarray,
-        requested_normal: float,
-        limited_normal: float,
-        failure: dict,
-    ) -> None:
-        """Print one compact diagnostic record for each normal-saturation episode."""
-        if self.limit_hold_reported:
-            return
-        limits = getattr(self.robot, "joint_limits", None)
-        if limits is None:
-            return
-        lower = np.asarray(limits["lower"], dtype=np.float64)
-        upper = np.asarray(limits["upper"], dtype=np.float64)
-        safe_clearance = np.minimum(
-            np.asarray(joint_position, dtype=np.float64) - self.safe_lower,
-            self.safe_upper - np.asarray(joint_position, dtype=np.float64),
-        )
-        raw_clearance = np.minimum(
-            np.asarray(joint_position, dtype=np.float64) - lower,
-            upper - np.asarray(joint_position, dtype=np.float64),
-        )
-        limiting = [
-            index + 1
-            for index, value in enumerate(safe_clearance)
-            if value <= float(np.min(safe_clearance)) + 1e-6
-        ]
-        print(
-            f"LIMIT_HOLD_{failure['kind']} 诊断："
-            f"拒绝原因={failure['detail']}，"
-            f"原请求越安全余量关节={failure['joints']}，"
-            f"投影候选最近边界关节={limiting}（不等同于失败原因），"
-            f"候选安全边界余量={float(np.min(safe_clearance)):+.3f} rad，"
-            f"候选原始边界余量={float(np.min(raw_clearance)):+.3f} rad，"
-            f"法向目标={requested_normal:+.3f}->{limited_normal:+.3f} m，"
-            f"目标={np.round(requested_target, 3).tolist()}，"
-            f"IK关节={np.round(joint_position, 3).tolist()}"
-        )
-        self.limit_hold_reported = True
-
-    def _safe_inverse_kinematics(
-        self, target_position: np.ndarray, init_q: np.ndarray, eps: float | None = None
-    ):
-        """Run fixed-link6-pose IK with an optional per-call tolerance."""
-        ik_eps = self.args.ik_eps if eps is None else float(eps)
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-            joint_position = self.robot.inverse_kinematics(
-                np.asarray(target_position, dtype=np.float64).tolist(),
-                self.screen_rotation,
-                np.asarray(init_q, dtype=np.float64),
-                max_iter=1000,
-                eps=ik_eps,
-                damping=1e-2,
-                adaptive_damping=True,
-                multi_init=False,
-            )
-        if joint_position is None:
-            self.last_ik_failure = {
-                "kind": "IK_PROJECTION", "joints": [],
-                "detail": "SDK未返回解；不能据此断言真实不可达或哪个关节越限",
-            }
-            return None
-        joint_position = np.asarray(joint_position, dtype=np.float64)
-        if joint_position.shape != (JOINT_COUNT,) or not np.all(np.isfinite(joint_position)):
-            self.last_ik_failure = {
-                "kind": "IK_PROJECTION", "joints": [], "detail": "SDK返回的关节解无效",
-            }
-            return None
-        outside = (joint_position < self.safe_lower) | (joint_position > self.safe_upper)
-        if np.any(outside):
-            self.last_ik_failure = {
-                "kind": "JOINT_MARGIN", "joints": (np.flatnonzero(outside) + 1).tolist(),
-                "detail": "SDK已返回解，但解超出配置的关节安全余量范围",
-            }
-            return None
-        self.last_ik_failure = None
-        return joint_position
-
-    def _search_reachable_target(
-        self,
-        target_position: np.ndarray,
-        current_position: np.ndarray,
-        normal: np.ndarray,
-        init_q: np.ndarray,
-    ):
-        """Back off only along screen normal, preserving the requested lateral position."""
-        desired_normal = float(np.dot(target_position, normal))
-        current_normal = float(np.dot(current_position, normal))
-        direction = float(np.sign(desired_normal - current_normal))
-        if direction == 0.0:
-            return None
-        tangent = target_position - normal * desired_normal
-        anchor = tangent + normal * current_normal
-        anchor_q = self._safe_inverse_kinematics(anchor, init_q)
-        if anchor_q is None:
-            # 若横向目标本身不可达，沿当前末端到目标的整条线寻找最近可达点。
-            low, high = 0.0, 1.0
-            low_q = self._safe_inverse_kinematics(current_position, init_q)
-            if low_q is None:
-                return None
-            best_position, best_q = current_position.copy(), low_q
-            for _ in range(8):
-                fraction = 0.5 * (low + high)
-                candidate = current_position + fraction * (target_position - current_position)
-                candidate_q = self._safe_inverse_kinematics(candidate, init_q)
-                if candidate_q is None:
-                    high = fraction
-                else:
-                    low = fraction
-                    best_position, best_q = candidate, candidate_q
-            return best_position, best_q
-
-        low, high = current_normal, desired_normal
-        if low > high:
-            low, high = high, low
-        best_position, best_q = anchor, anchor_q
-        for _ in range(10):
-            mid = 0.5 * (low + high)
-            candidate = tangent + normal * mid
-            candidate_q = self._safe_inverse_kinematics(candidate, init_q)
-            if candidate_q is None:
-                high = mid if direction > 0.0 else high
-                low = low if direction > 0.0 else mid
-            else:
-                best_position, best_q = candidate, candidate_q
-                low = mid if direction > 0.0 else low
-                high = high if direction > 0.0 else mid
-        return best_position, best_q
-
     def _handle_lost_target(self, now: float) -> None:
         with self.lock:
             if self.status == "HOME":
@@ -969,17 +882,30 @@ class TrackingController:
             if self.lost_since is None:
                 self.lost_since = now
             self.desired_joint = self.command_joint.copy()
-            if now - self.lost_since >= self.args.lost_timeout:
-                self.status = "RETURNING"
-                self.desired_joint = self.home_position.copy()
-                self.last_ik_target = None
-                self.smoothed_target = None
-                self.normal_saturation = None
-                self.normal_saturation_direction = 0.0
-                self.limit_hold_reported = False
-                self.limit_hold_reason = None
-            else:
+            if now - self.lost_since < self.args.lost_timeout:
                 self.status = "LOST"
+                return
+            if self.status == "RETURNING":
+                return
+            self.return_trajectory = SynchronizedJointTrajectory(
+                self.command_joint,
+                self.home_position,
+                self.max_speed,
+                self.max_accel,
+                minimum_duration=max(0.25, 2.0 * self.args.control_period),
+            )
+            self.return_elapsed = 0.0
+            self.status = "RETURNING"
+            self.desired_joint = self.home_position.copy()
+            self.command_velocity.fill(0.0)
+            self.cartesian_command_ready = False
+            self.cartesian_command_velocity.fill(0.0)
+            self.qdot_previous_previous.fill(0.0)
+            self.smoothed_target = None
+            print(
+                f"目标持续丢失：同步返回 HOME，"
+                f"预计 {self.return_trajectory.duration:.2f} s。"
+            )
 
 
 def initialize_realsense(args: argparse.Namespace):
@@ -998,19 +924,72 @@ def initialize_realsense(args: argparse.Namespace):
     return pipeline, align, intrinsics
 
 
-def return_to_zero(robot, velocity: float) -> None:
-    """Exit action: return to true six-joint zero, then stop the motors."""
-    zero = [0.0] * JOINT_COUNT
-    print("退出：返回零位 [0, 0, 0, 0, 0, 0]...")
+def return_to_zero(
+    robot,
+    velocity: float,
+    acceleration: float,
+    control_period: float,
+) -> None:
+    """以同步七次插值返回真实六关节零位，然后停止电机。"""
+    zero = np.zeros(JOINT_COUNT, dtype=np.float64)
+    current = np.asarray(robot.get_current_pos(), dtype=np.float64)
+    if current.shape != (JOINT_COUNT,) or not np.all(np.isfinite(current)):
+        robot.set_stop()
+        raise RuntimeError("退出时无法读取有效的六关节位置")
+    configured_speed = np.asarray(
+        getattr(robot, "velocity_limits", [velocity] * JOINT_COUNT),
+        dtype=np.float64,
+    )
+    configured_accel = np.asarray(
+        getattr(robot, "acceleration_limits", [acceleration] * JOINT_COUNT),
+        dtype=np.float64,
+    )
+    max_speed = np.minimum(configured_speed, float(velocity))
+    max_accel = np.minimum(configured_accel, float(acceleration))
+    trajectory = SynchronizedJointTrajectory(
+        current,
+        zero,
+        max_speed,
+        max_accel,
+        minimum_duration=max(0.25, 2.0 * float(control_period)),
+    )
+    print(
+        "退出：同步返回零位 [0, 0, 0, 0, 0, 0]，"
+        f"预计 {trajectory.duration:.2f} s..."
+    )
     try:
-        reached = robot.Joint_Pos_Vel(
-            zero,
-            [velocity] * JOINT_COUNT,
-            robot.max_torque.tolist(),
-            iswait=True,
-            tolerance=0.01,
-            timeout=30.0,
-        )
+        started = time.perf_counter()
+        next_tick = started
+        while True:
+            elapsed = time.perf_counter() - started
+            position, joint_velocity, complete = trajectory.sample(elapsed)
+            accepted = robot.Joint_Pos_Vel(
+                position.tolist(),
+                joint_velocity.tolist(),
+                robot.max_torque.tolist(),
+                iswait=False,
+            )
+            if not accepted:
+                raise RuntimeError("同步回零命令被 SDK 拒绝")
+            if complete:
+                break
+            next_tick += float(control_period)
+            remaining = next_tick - time.perf_counter()
+            if remaining > 0.0:
+                time.sleep(remaining)
+
+        settle_deadline = time.monotonic() + 2.0
+        reached = False
+        while time.monotonic() < settle_deadline:
+            actual = np.asarray(robot.get_current_pos(), dtype=np.float64)
+            if (
+                actual.shape == (JOINT_COUNT,)
+                and np.all(np.isfinite(actual))
+                and np.max(np.abs(actual - zero)) <= 0.01
+            ):
+                reached = True
+                break
+            time.sleep(float(control_period))
         if not reached:
             print("回零超时，发送停止命令。", file=sys.stderr)
     finally:
@@ -1031,7 +1010,6 @@ def main() -> int:
     if robot.motor_count != JOINT_COUNT or getattr(robot, "gripper_enabled", True):
         raise RuntimeError("跟踪脚本要求无夹爪六轴配置")
     pipeline = None
-    pose_model = None
     try:
         print(f"HOME 位置：{home_position.tolist()}")
         report_joint_safety_margin(robot, home_position, args.joint_limit_margin)
@@ -1043,7 +1021,6 @@ def main() -> int:
             raise RuntimeError("机械臂未能到达 detect_test_pos.md 的 HOME 位")
 
         detector = load_detector(args.model.resolve(), args.det_size, args.det_thresh)
-        pose_model = load_pose_model(args.pose_model.resolve())
         pipeline, align, intrinsics = initialize_realsense(args)
         fk_home = robot.forward_kinematics(home_position)
         if fk_home is None:
@@ -1052,7 +1029,12 @@ def main() -> int:
     except KeyboardInterrupt:
         if pipeline is not None:
             pipeline.stop()
-        return_to_zero(robot, args.exit_velocity)
+        return_to_zero(
+            robot,
+            args.exit_velocity,
+            args.max_joint_accel,
+            args.control_period,
+        )
         raise
 
     controller = TrackingController(
@@ -1079,17 +1061,17 @@ def main() -> int:
             color = np.asanyarray(color_frame.get_data()).copy()
             detections = detect_faces(detector, color, depth_frame, intrinsics, args)
             selected = select_nearest_target(detections)
-            pose_deg = None if selected is None else estimate_face_pose(pose_model, color, selected)
-            controller.update_face_pose(
-                pose_deg,
-                None if pose_deg is None else time.monotonic(),
-            )
             accepted_point = target_gate.update(
                 None if selected is None else selected["point_camera"]
             )
+            observation_time = time.monotonic() if accepted_point is not None else None
             controller.update_target(
                 accepted_point,
-                None if accepted_point is None else time.monotonic(),
+                observation_time,
+            )
+            controller.update_face_observation(
+                None if selected is None or accepted_point is None else selected.get("face_normal_camera"),
+                observation_time,
             )
             status, enabled, _ = controller.snapshot()
             if status == "ERROR":
@@ -1100,17 +1082,64 @@ def main() -> int:
             fps = instant_fps if fps == 0.0 else 0.9 * fps + 0.1 * instant_fps
             display_status = status if enabled else "HOLD"
             draw_detections(color, detections, selected, display_status, fps)
-            if pose_deg is not None:
-                cv2.putText(
-                    color,
-                    f"face pose P={pose_deg[0]:+.1f} Y={pose_deg[1]:+.1f} R={pose_deg[2]:+.1f} deg",
-                    (16, 58),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (255, 255, 0),
-                    2,
-                    cv2.LINE_AA,
+            recline = controller.recline_snapshot()
+            raw_pitch = recline["raw_pitch"]
+            pose_error = None if selected is None else selected.get("pose_reprojection_error")
+            raw_text = "--" if raw_pitch is None else f"{raw_pitch:+.1f}"
+            filtered_text = "--" if recline["pitch"] is None else f"{recline['pitch']:+.1f}"
+            error_text = "--" if pose_error is None else f"{pose_error:.1f}px"
+            if recline["calibrated"]:
+                detail = (
+                    f"dP={recline['pitch_delta']:+.1f}deg "
+                    f"dZ={recline['height_drop']:+.2f}m "
+                    f"dD={recline['depth_shift']:+.2f}m "
+                    f"gate={100.0 * recline['progress']:.0f}%"
                 )
+            else:
+                detail = f"calibrating {100.0 * recline['progress']:.0f}%"
+            cv2.putText(
+                color,
+                f"mode={recline['mode']} world={raw_text}/{filtered_text}deg err={error_text}",
+                (16, 58),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                (255, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                color,
+                detail,
+                (16, 84),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                (0, 165, 255) if recline["progress"] > 0.0 else (255, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                color,
+                f"blend={100.0 * recline['blend']:.0f}% "
+                f"transition-speed={100.0 * recline['governor']:.0f}%"
+                f"{' TIMEOUT' if recline['timed_out'] else ''}",
+                (16, 110),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                (0, 165, 255) if recline["active"] else (255, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                color,
+                f"tracking={recline['follow_state']} "
+                f"gain={100.0 * recline['follow_gain']:.0f}%",
+                (16, 136),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                (255, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
             cv2.imshow(DEFAULT_WINDOW, color)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("c"), ord("C")):
@@ -1125,20 +1154,373 @@ def main() -> int:
         controller.stop()
         cv2.destroyAllWindows()
         pipeline.stop()
-        return_to_zero(robot, args.exit_velocity)
+        return_to_zero(
+            robot,
+            args.exit_velocity,
+            args.max_joint_accel,
+            args.control_period,
+        )
     return 0
 
 
 ORIGINAL_DETECT_FACES = detect_faces
-ORIGINAL_FACE_TO_SCREEN_TARGET = face_to_screen_target
 
 # 动态姿态滤波，避免人脸深度噪声直接变成屏幕角度抖动。
 POSE_FOLLOW_ALPHA = 0.08
+FACE_POSITION_ALPHA = 0.12
 # 只跟随水平偏航；俯仰和滚转保留 HOME，避免深度噪声导致大幅抬头/低头。
 MAX_YAW_OFFSET = math.radians(45.0)
 PITCH_TASK_WEIGHT = 20.0
 YAW_TASK_WEIGHT = 50.0
 ROLL_TASK_WEIGHT = 50.0
+
+# SCRFD 五点顺序：左眼、右眼、鼻尖、左嘴角、右嘴角。数值只定义一个
+# 通用脸部形状；solvePnP 在这里仅取朝向，不使用平移或人脸绝对尺度。
+FACE_MODEL_5_POINTS = np.array(
+    [
+        [-30.0, 35.0, -30.0],
+        [30.0, 35.0, -30.0],
+        [0.0, 0.0, 0.0],
+        [-25.0, -30.0, -25.0],
+        [25.0, -30.0, -25.0],
+    ],
+    dtype=np.float64,
+)
+
+
+def estimate_face_normal_5point(points: np.ndarray, intrinsics, max_error: float):
+    """用 SCRFD 五点粗估脸部朝向。
+
+    返回重投影误差和相机坐标系脸部法向。控制器会把法向转到基坐标系后
+    再做档位判定，避免屏幕俯仰改变测量基准。
+    """
+    image_points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if image_points.shape != (5, 2) or not np.all(np.isfinite(image_points)):
+        return None, None
+    camera_matrix = np.array(
+        [
+            [float(intrinsics.fx), 0.0, float(intrinsics.ppx)],
+            [0.0, float(intrinsics.fy), float(intrinsics.ppy)],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    distortion = np.asarray(getattr(intrinsics, "coeffs", [0.0] * 5), dtype=np.float64)
+    if distortion.size < 4 or not np.all(np.isfinite(distortion)):
+        distortion = np.zeros(5, dtype=np.float64)
+    try:
+        solved, rotation_vector, translation = cv2.solvePnP(
+            FACE_MODEL_5_POINTS,
+            image_points,
+            camera_matrix,
+            distortion,
+            flags=cv2.SOLVEPNP_EPNP,
+        )
+        if not solved or float(np.asarray(translation).reshape(3)[2]) <= 0.0:
+            return None, None
+        solved, rotation_vector, translation = cv2.solvePnP(
+            FACE_MODEL_5_POINTS,
+            image_points,
+            camera_matrix,
+            distortion,
+            rotation_vector,
+            translation,
+            True,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        if not solved:
+            return None, None
+        projected, _ = cv2.projectPoints(
+            FACE_MODEL_5_POINTS,
+            rotation_vector,
+            translation,
+            camera_matrix,
+            distortion,
+        )
+        residual = projected.reshape(-1, 2) - image_points
+        reprojection_error = float(np.sqrt(np.mean(np.sum(residual * residual, axis=1))))
+        if not np.isfinite(reprojection_error) or reprojection_error > float(max_error):
+            return reprojection_error, None
+        rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+        face_normal = rotation_matrix @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        # 通用模型的 +Z 指向脸外；它应朝向相机。PnP 偶尔给出翻转解时统一方向。
+        if face_normal[2] > 0.0:
+            face_normal = -face_normal
+        return reprojection_error, face_normal
+    except cv2.error:
+        return None, None
+
+
+def smoothstep5(value: float) -> float:
+    """端点速度和加速度均为零的五次过渡曲线。"""
+    value = float(np.clip(value, 0.0, 1.0))
+    return value ** 3 * (10.0 + value * (-15.0 + 6.0 * value))
+
+
+class AdaptiveModeTransition:
+    """用单一进度同步位置与姿态，并在末端误差增大时整体放慢。"""
+
+    def __init__(self, args):
+        self.args = args
+        self.reset()
+
+    def reset(self, blend: float = 0.0) -> None:
+        self.blend = float(np.clip(blend, 0.0, 1.0))
+        self.start_blend = self.blend
+        self.target_blend = self.blend
+        self.phase = 1.0
+        self.governor = 1.0
+        self.elapsed = 0.0
+        self.timed_out = False
+
+    @property
+    def active(self) -> bool:
+        return self.phase < 1.0 and not self.timed_out
+
+    def set_target(self, target: float) -> None:
+        target = float(np.clip(target, 0.0, 1.0))
+        if abs(target - self.target_blend) <= 1e-9:
+            return
+        self.start_blend = self.blend
+        self.target_blend = target
+        self.phase = 0.0
+        self.elapsed = 0.0
+        self.timed_out = False
+
+    def update(self, dt: float, joint_execution_error: float) -> float:
+        if self.timed_out:
+            return self.blend
+        if self.phase >= 1.0:
+            self.blend = self.target_blend
+            self.governor = 1.0
+            return self.blend
+        error_ratio = float(joint_execution_error) / float(
+            self.args.transition_joint_error
+        )
+        if error_ratio <= 1.0:
+            desired_governor = 1.0
+        elif error_ratio >= 2.0:
+            desired_governor = 0.0
+        else:
+            desired_governor = 1.0 - smoothstep5(error_ratio - 1.0)
+        dt = float(np.clip(dt, 1e-4, 0.05))
+        self.elapsed += dt
+        if self.elapsed >= float(self.args.recline_transition_timeout):
+            self.timed_out = True
+            self.governor = 0.0
+            return self.blend
+        alpha = 1.0 - math.exp(-dt / float(self.args.transition_governor_tau))
+        self.governor += alpha * (desired_governor - self.governor)
+        distance = max(abs(self.target_blend - self.start_blend), 1e-6)
+        duration = float(self.args.recline_transition_time) * distance
+        self.phase = min(1.0, self.phase + self.governor * dt / duration)
+        self.blend = self.start_blend + (
+            self.target_blend - self.start_blend
+        ) * smoothstep5(self.phase)
+        if self.phase >= 1.0:
+            self.blend = self.target_blend
+            self.governor = 1.0
+        return self.blend
+
+    def snapshot(self) -> dict:
+        return {
+            "blend": self.blend,
+            "target": self.target_blend,
+            "phase": self.phase,
+            "governor": self.governor,
+            "active": self.active,
+            "timed_out": self.timed_out,
+        }
+
+
+class TaskSpaceHold:
+    """对位置三轴和水平偏航共用一个带滞回的 FOLLOW/HOLD 状态。"""
+
+    FOLLOW = "FOLLOW"
+    HOLD = "HOLD"
+
+    def __init__(self, args):
+        self.args = args
+        self.reset()
+
+    def reset(self) -> None:
+        self.state = self.FOLLOW
+        self.gain = 1.0
+
+    def update(
+        self,
+        dt: float,
+        horizontal_error: float,
+        vertical_error: float,
+        distance_error: float,
+        yaw_error: float,
+        transition_active: bool,
+    ) -> float:
+        enter_limits = np.array(
+            [
+                self.args.hold_horizontal_enter,
+                self.args.hold_vertical_enter,
+                self.args.hold_distance_enter,
+                math.radians(self.args.hold_yaw_enter),
+            ],
+            dtype=np.float64,
+        )
+        exit_limits = np.array(
+            [
+                self.args.hold_horizontal_exit,
+                self.args.hold_vertical_exit,
+                self.args.hold_distance_exit,
+                math.radians(self.args.hold_yaw_exit),
+            ],
+            dtype=np.float64,
+        )
+        errors = np.abs(np.array(
+            [horizontal_error, vertical_error, distance_error, yaw_error],
+            dtype=np.float64,
+        ))
+        if transition_active:
+            self.state = self.FOLLOW
+        elif self.state == self.HOLD:
+            if np.any(errors >= enter_limits):
+                self.state = self.FOLLOW
+        elif np.all(errors <= exit_limits):
+            self.state = self.HOLD
+
+        target_gain = 1.0 if self.state == self.FOLLOW else 0.0
+        dt = float(np.clip(dt, 1e-4, 0.05))
+        alpha = 1.0 - math.exp(-dt / float(self.args.hold_blend_time))
+        self.gain += alpha * (target_gain - self.gain)
+        if self.state == self.HOLD and self.gain < 1e-3:
+            self.gain = 0.0
+        elif self.state == self.FOLLOW and self.gain > 1.0 - 1e-3:
+            self.gain = 1.0
+        return self.gain
+
+    def snapshot(self) -> dict:
+        return {"follow_state": self.state, "follow_gain": self.gain}
+
+
+class ReclineModeTracker:
+    """以脸部俯仰为主、基坐标三维位移为辅的两态锁存器。"""
+
+    NORMAL = "NORMAL"
+    RECLINED = "RECLINED"
+
+    def __init__(self, args, forward_axis_base: np.ndarray):
+        self.args = args
+        axis = np.asarray(forward_axis_base, dtype=np.float64).reshape(3)
+        axis_norm = float(np.linalg.norm(axis))
+        if not np.isfinite(axis_norm) or axis_norm <= 1e-9:
+            raise ValueError("半躺检测的前向基准轴无效")
+        self.forward_axis_base = axis / axis_norm
+        self.reset()
+
+    def reset(self) -> None:
+        self.mode = self.NORMAL
+        self.raw_pitch = None
+        self.filtered_pitch = None
+        self.baseline_pitch = None
+        self.baseline_point = None
+        self.pitch_samples = []
+        self.point_samples = []
+        self.candidate_since = None
+        self.last_observation_time = None
+        self.pitch_delta = 0.0
+        self.height_drop = 0.0
+        self.depth_shift = 0.0
+        self.transition_progress = 0.0
+
+    @property
+    def calibrated(self) -> bool:
+        return self.baseline_pitch is not None and self.baseline_point is not None
+
+    def _hold_progress(self, timestamp: float, duration: float) -> float:
+        if self.candidate_since is None:
+            return 0.0
+        return float(np.clip((timestamp - self.candidate_since) / duration, 0.0, 1.0))
+
+    def update(self, pitch_deg: float, point_base: np.ndarray, timestamp: float) -> bool:
+        """处理一帧观测；仅在模式实际改变时返回 True。"""
+        point = np.asarray(point_base, dtype=np.float64).reshape(-1)
+        if point.shape != (3,) or not np.all(np.isfinite(point)) or not np.isfinite(pitch_deg):
+            self.candidate_since = None
+            self.transition_progress = 0.0
+            return False
+        timestamp = float(timestamp)
+        if (
+            self.last_observation_time is not None
+            and timestamp - self.last_observation_time > 0.25
+        ):
+            self.candidate_since = None
+        self.last_observation_time = timestamp
+        self.raw_pitch = float(pitch_deg)
+
+        if self.filtered_pitch is None:
+            self.filtered_pitch = float(pitch_deg)
+        else:
+            alpha = float(self.args.recline_pose_alpha)
+            self.filtered_pitch = alpha * float(pitch_deg) + (1.0 - alpha) * self.filtered_pitch
+
+        if not self.calibrated:
+            self.pitch_samples.append(self.filtered_pitch)
+            self.point_samples.append(point.copy())
+            required = int(self.args.recline_baseline_frames)
+            self.transition_progress = min(len(self.pitch_samples) / required, 1.0)
+            if len(self.pitch_samples) >= required:
+                self.baseline_pitch = float(np.median(np.asarray(self.pitch_samples)))
+                self.baseline_point = np.median(np.asarray(self.point_samples), axis=0)
+                self.pitch_samples.clear()
+                self.point_samples.clear()
+                self.transition_progress = 0.0
+            return False
+
+        self.pitch_delta = float(self.args.recline_pitch_sign) * (
+            self.filtered_pitch - self.baseline_pitch
+        )
+        self.height_drop = float(self.baseline_point[2] - point[2])
+        self.depth_shift = float(np.dot(point - self.baseline_point, self.forward_axis_base))
+
+        changed = False
+        if self.mode == self.NORMAL:
+            pose_ready = self.pitch_delta >= float(self.args.recline_enter_pitch)
+            evidence = (
+                pose_ready
+                and self.height_drop >= float(self.args.recline_height_drop)
+            )
+            hold_time = float(self.args.recline_enter_hold)
+            next_mode = self.RECLINED
+        else:
+            # 退出只看双眼是否恢复到正常坐姿高度。PnP 俯仰在相机视角变化后
+            # 仍可能带有固定偏差，不应阻止屏幕平滑回正。
+            evidence = self.height_drop <= float(self.args.recline_exit_height)
+            hold_time = float(self.args.recline_exit_hold)
+            next_mode = self.NORMAL
+
+        if evidence:
+            if self.candidate_since is None:
+                self.candidate_since = timestamp
+            self.transition_progress = self._hold_progress(timestamp, hold_time)
+            if timestamp - self.candidate_since >= hold_time:
+                self.mode = next_mode
+                self.candidate_since = None
+                self.transition_progress = 0.0
+                changed = True
+        else:
+            self.candidate_since = None
+            self.transition_progress = 0.0
+        return changed
+
+    def snapshot(self) -> dict:
+        return {
+            "mode": self.mode,
+            "calibrated": self.calibrated,
+            "raw_pitch": self.raw_pitch,
+            "pitch": self.filtered_pitch,
+            "pitch_delta": self.pitch_delta,
+            "height_drop": self.height_drop,
+            "depth_shift": self.depth_shift,
+            "progress": self.transition_progress,
+        }
 
 def detect_faces_eye_center(detector, color, depth_frame, intrinsics, args):
     """复用原检测流程，但将跟踪点改为双眼中心。
@@ -1152,6 +1534,11 @@ def detect_faces_eye_center(detector, color, depth_frame, intrinsics, args):
         if points is None or np.asarray(points).shape[0] < 2:
             continue
         points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        pose_error, face_normal_camera = estimate_face_normal_5point(
+            points,
+            intrinsics,
+            args.pose_max_reprojection_error,
+        )
         eye_center = 0.5 * (points[0] + points[1])
         eye_points_camera = []
         eye_depths = []
@@ -1190,50 +1577,114 @@ def detect_faces_eye_center(detector, color, depth_frame, intrinsics, args):
         item["center"] = (float(eye_center[0]), float(eye_center[1]))
         item["depth_m"] = depth_m
         item["point_camera"] = point_camera
+        item["pose_reprojection_error"] = pose_error
+        item["face_normal_camera"] = face_normal_camera
     return detections
 
 
-def same_height_face_to_screen_target(
-    point_camera, fk, camera_rotation, screen_distance, screen_rotation,
-    camera_centering_gain=1.0,
-):
-    """复用原目标几何，但强制屏幕中心与双眼中心同高。"""
-    target = ORIGINAL_FACE_TO_SCREEN_TARGET(
-        point_camera,
-        fk,
-        camera_rotation,
-        screen_distance,
-        screen_rotation,
-        camera_centering_gain,
-    )
-    _, t_base_camera = make_transforms(fk, camera_rotation)
-    eye_h = t_base_camera @ np.append(np.asarray(point_camera, dtype=np.float64), 1.0)
-    target[2] = eye_h[2]
-    return target
-
-
 class DynamicPoseTrackingController(TrackingController):
-    """用 dynamic yaw 加 InsightFace 脸部姿态生成屏幕目标姿态。"""
+    """实时生成“法向指向人脸、HOME 滚转”的屏幕姿态。"""
 
     def __init__(self, robot, home_position, camera_rotation, screen_rotation, args):
         super().__init__(robot, home_position, camera_rotation, screen_rotation, args)
         self.home_screen_rotation = np.asarray(screen_rotation, dtype=np.float64).copy()
-        self.latest_face_pose = None
-        self.latest_face_pose_time = None
+        home_forward = screen_normal_in_base(self.home_screen_rotation, self.camera_rotation)
+        self.recline_tracker = ReclineModeTracker(args, home_forward)
+        self.mode_transition = AdaptiveModeTransition(args)
+        self.task_hold = TaskSpaceHold(args)
+        self.filtered_yaw = 0.0
+        self.filtered_face_base = None
+        self.transition_timeout_reported = False
+        self.latest_control_dt = float(args.control_period)
+        self.latest_face_normal_camera = None
+        self.latest_face_normal_time = None
+        self.last_recline_observation_time = None
 
-    def update_face_pose(self, pose_deg: np.ndarray | None, timestamp: float | None) -> None:
+    def set_tracking_enabled(self, enabled: bool) -> None:
+        super().set_tracking_enabled(enabled)
         with self.lock:
-            if pose_deg is None or timestamp is None:
-                self.latest_face_pose = None
-                self.latest_face_pose_time = None
+            self.recline_tracker.reset()
+            self.mode_transition.set_target(0.0)
+            self.task_hold.reset()
+            self.filtered_face_base = None
+            self.transition_timeout_reported = False
+            self.latest_face_normal_camera = None
+            self.latest_face_normal_time = None
+            self.last_recline_observation_time = None
+
+    def update_face_observation(
+        self, face_normal_camera: np.ndarray | None, timestamp: float | None
+    ) -> None:
+        with self.lock:
+            if face_normal_camera is None or timestamp is None:
+                self.latest_face_normal_camera = None
+                self.latest_face_normal_time = None
                 return
-            pose = np.asarray(pose_deg, dtype=np.float64).reshape(-1)
-            if pose.shape != (3,) or not np.all(np.isfinite(pose)):
-                self.latest_face_pose = None
-                self.latest_face_pose_time = None
+            normal = np.asarray(face_normal_camera, dtype=np.float64).reshape(-1)
+            if normal.shape != (3,) or not np.all(np.isfinite(normal)):
+                self.latest_face_normal_camera = None
+                self.latest_face_normal_time = None
                 return
-            self.latest_face_pose = pose.copy()
-            self.latest_face_pose_time = float(timestamp)
+            self.latest_face_normal_camera = normal.copy()
+            self.latest_face_normal_time = float(timestamp)
+
+    def recline_snapshot(self) -> dict:
+        with self.lock:
+            snapshot = self.recline_tracker.snapshot()
+            snapshot.update(self.mode_transition.snapshot())
+            snapshot.update(self.task_hold.snapshot())
+            return snapshot
+
+    def _face_target(self, point_camera: np.ndarray, fk: dict) -> np.ndarray:
+        _, t_base_camera = make_transforms(fk, self.camera_rotation)
+        observed_face_base = t_base_camera @ np.append(
+            np.asarray(point_camera, dtype=np.float64), 1.0
+        )
+        with self.lock:
+            if self.filtered_face_base is None:
+                self.filtered_face_base = observed_face_base[:3].copy()
+            else:
+                self.filtered_face_base = (
+                    FACE_POSITION_ALPHA * observed_face_base[:3]
+                    + (1.0 - FACE_POSITION_ALPHA) * self.filtered_face_base
+                )
+            filtered_face_base = self.filtered_face_base.copy()
+        filtered_face_camera = np.linalg.inv(t_base_camera) @ np.append(
+            filtered_face_base, 1.0
+        )
+        return face_to_screen_target(
+            filtered_face_camera[:3],
+            fk,
+            self.camera_rotation,
+            self.args.screen_distance,
+            self.screen_rotation,
+            self.args.camera_centering_gain,
+        )
+
+    def _smooth_face_target(self, raw_target: np.ndarray) -> np.ndarray:
+        # 人脸位置已在不随相机运动的基坐标系滤波；模式位移由五次进度生成。
+        # 此处不再叠加目标低通，避免位置和俯仰产生不同的相位延迟。
+        return np.asarray(raw_target, dtype=np.float64).copy()
+
+    def _apply_downward_pitch(
+        self, rotation: np.ndarray, angle_deg: float | None = None
+    ) -> np.ndarray:
+        """绕屏幕水平轴选择真正使光轴向下的固定俯视方向。"""
+        rotation = np.asarray(rotation, dtype=np.float64)
+        camera_horizontal = np.asarray(self.camera_rotation[:, 0], dtype=np.float64)
+        axis_base = rotation @ camera_horizontal
+        axis_norm = float(np.linalg.norm(axis_base))
+        if not np.isfinite(axis_norm) or axis_norm <= 1e-9:
+            return rotation
+        axis_base /= axis_norm
+        angle = math.radians(float(
+            self.args.recline_pitch_angle if angle_deg is None else angle_deg
+        ))
+        positive = Rotation.from_rotvec(axis_base * angle).as_matrix() @ rotation
+        negative = Rotation.from_rotvec(-axis_base * angle).as_matrix() @ rotation
+        positive_z = float(screen_normal_in_base(positive, self.camera_rotation)[2])
+        negative_z = float(screen_normal_in_base(negative, self.camera_rotation)[2])
+        return positive if positive_z < negative_z else negative
 
     def _screen_rotation_toward_face(self, fk: dict, point_camera: np.ndarray):
         """只根据水平投影调整偏航，俯仰/滚转保持 HOME。"""
@@ -1255,56 +1706,163 @@ class DynamicPoseTrackingController(TrackingController):
             float(np.clip(np.dot(home_horizontal, face_horizontal), -1.0, 1.0)),
         )
         yaw = float(np.clip(yaw, -MAX_YAW_OFFSET, MAX_YAW_OFFSET))
-        desired_rotation = Rotation.from_rotvec(vertical * yaw).as_matrix() @ self.home_screen_rotation
-
-        # 在 SO(3) 上做短弧滤波，而不是逐元素插值旋转矩阵。
-        current = np.asarray(self.screen_rotation, dtype=np.float64)
-        relative = Rotation.from_matrix(current.T @ desired_rotation).as_rotvec()
-        return current @ Rotation.from_rotvec(POSE_FOLLOW_ALPHA * relative).as_matrix()
+        with self.lock:
+            yaw_delta = math.atan2(
+                math.sin(yaw - self.filtered_yaw),
+                math.cos(yaw - self.filtered_yaw),
+            )
+            self.filtered_yaw += POSE_FOLLOW_ALPHA * yaw_delta
+            filtered_yaw = self.filtered_yaw
+            blend = self.mode_transition.blend
+        normal_rotation = (
+            Rotation.from_rotvec(vertical * filtered_yaw).as_matrix()
+            @ self.home_screen_rotation
+        )
+        return self._apply_downward_pitch(
+            normal_rotation,
+            blend * float(self.args.recline_pitch_angle),
+        )
 
     def _handle_fresh_target(self, point_camera, previous_status, command_joint, command_velocity, dt):
+        self.latest_control_dt = float(np.clip(dt, 1e-4, 0.05))
         actual_q = np.asarray(self.robot.get_current_pos(), dtype=np.float64)
         if actual_q.shape == (JOINT_COUNT,) and np.all(np.isfinite(actual_q)):
             fk = self.robot.forward_kinematics(actual_q)
             if fk is not None:
+                with self.lock:
+                    face_normal_camera = self.latest_face_normal_camera
+                    pose_time = self.latest_face_normal_time
+                if (
+                    face_normal_camera is not None
+                    and pose_time is not None
+                    and pose_time != self.last_recline_observation_time
+                ):
+                    _, t_base_camera = make_transforms(fk, self.camera_rotation)
+                    face_h = t_base_camera @ np.append(
+                        np.asarray(point_camera, dtype=np.float64), 1.0
+                    )
+                    rotation_base_camera = (
+                        np.asarray(fk["rotation"], dtype=np.float64) @ self.camera_rotation
+                    )
+                    face_normal_base = rotation_base_camera @ face_normal_camera
+                    world_pitch_deg = math.degrees(math.atan2(
+                        float(face_normal_base[2]),
+                        float(np.hypot(face_normal_base[0], face_normal_base[1])),
+                    ))
+                    with self.lock:
+                        changed = self.recline_tracker.update(
+                            world_pitch_deg,
+                            face_h[:3],
+                            pose_time,
+                        )
+                        mode = self.recline_tracker.mode
+                    self.last_recline_observation_time = pose_time
+                    if changed:
+                        target_pitch = (
+                            self.args.recline_pitch_angle
+                            if mode == ReclineModeTracker.RECLINED
+                            else 0.0
+                        )
+                        print(
+                            f"俯仰模式切换：{mode}；"
+                            f"目标俯视角={target_pitch:.1f}°"
+                        )
+                with self.lock:
+                    target_blend = (
+                        1.0
+                        if self.recline_tracker.mode == ReclineModeTracker.RECLINED
+                        else 0.0
+                    )
+                    self.mode_transition.set_target(target_blend)
+                    joint_execution_error = float(np.max(np.abs(actual_q - command_joint)))
+                    self.mode_transition.update(dt, joint_execution_error)
+                    if self.mode_transition.timed_out and not self.transition_timeout_reported:
+                        print(
+                            "模式过渡超时：保持当前安全过渡位置；"
+                            "请检查关节限位或降低俯视角。",
+                            file=sys.stderr,
+                        )
+                        self.transition_timeout_reported = True
+                    elif not self.mode_transition.timed_out:
+                        self.transition_timeout_reported = False
                 dynamic_rotation = self._screen_rotation_toward_face(fk, point_camera)
                 if dynamic_rotation is not None:
-                    with self.lock:
-                        pose = None
-                        if (
-                            self.latest_face_pose is not None
-                            and self.latest_face_pose_time is not None
-                            and time.monotonic() - self.latest_face_pose_time <= self.args.pose_timeout
-                        ):
-                            pose = self.latest_face_pose.copy()
-                    if pose is not None:
-                        pose = pose.copy()
-                        pose[np.abs(pose) < self.args.pose_deadzone] = 0.0
-                        pose = np.clip(pose, [-45.0, -60.0, -60.0], [45.0, 60.0, 60.0])
-                        pose_local_camera = Rotation.from_euler(
-                            "xyz", np.deg2rad(pose), degrees=False
-                        ).as_matrix()
-                        pose_local_link6 = (
-                            self.camera_rotation.T @ pose_local_camera @ self.camera_rotation
-                        )
-                        desired_rotation = dynamic_rotation @ pose_local_link6
-                        current = np.asarray(self.screen_rotation, dtype=np.float64)
-                        relative = Rotation.from_matrix(
-                            current.T @ desired_rotation
-                        ).as_rotvec()
-                        self.screen_rotation = current @ Rotation.from_rotvec(
-                            self.args.pose_alpha * relative
-                        ).as_matrix()
-                    else:
-                        self.screen_rotation = dynamic_rotation
+                    self.screen_rotation = dynamic_rotation
         return super()._handle_fresh_target(
             point_camera, previous_status, command_joint, command_velocity, dt
         )
 
-    def _solve_velocity_qp(self, q_command, qdot_previous, current_fk, desired_twist, dt):
+    def _handle_lost_target(self, now: float) -> None:
+        super()._handle_lost_target(now)
+        with self.lock:
+            if self.status == "RETURNING" and (
+                self.recline_tracker.mode != ReclineModeTracker.NORMAL
+                or self.last_recline_observation_time is not None
+            ):
+                # 丢脸返回 HOME 时退出半躺档，但保留本次 tracking 会话的
+                # 正常坐姿基准，避免短暂遮挡后把半躺姿态重新标成 NORMAL。
+                self.recline_tracker.mode = ReclineModeTracker.NORMAL
+                self.recline_tracker.filtered_pitch = None
+                self.recline_tracker.candidate_since = None
+                self.recline_tracker.transition_progress = 0.0
+                self.recline_tracker.last_observation_time = None
+                self.mode_transition.reset(0.0)
+                self.task_hold.reset()
+                self.filtered_yaw = 0.0
+                self.filtered_face_base = None
+                self.transition_timeout_reported = False
+                self.latest_face_normal_camera = None
+                self.latest_face_normal_time = None
+                self.last_recline_observation_time = None
+                self.screen_rotation = self.home_screen_rotation.copy()
+                print("目标持续丢失：半躺模式已重置为 NORMAL。")
+
+    def _desired_twist(self, current_fk: dict, target_position: np.ndarray) -> np.ndarray:
+        desired_twist = super()._desired_twist(current_fk, target_position)
+        current_position = np.asarray(current_fk["position"], dtype=np.float64)
+        current_rotation = np.asarray(current_fk["rotation"], dtype=np.float64)
+        position_error_base = np.asarray(target_position, dtype=np.float64) - current_position
+        rotation_base_camera = current_rotation @ self.camera_rotation
+        position_error_camera = rotation_base_camera.T @ position_error_base
+        rotation_error = Rotation.from_matrix(
+            self.screen_rotation @ current_rotation.T
+        ).as_rotvec()
+        yaw_error = float(np.dot(rotation_error, np.array([0.0, 0.0, 1.0])))
+        with self.lock:
+            gain = self.task_hold.update(
+                self.latest_control_dt,
+                position_error_camera[0],
+                position_error_camera[1],
+                position_error_camera[2],
+                yaw_error,
+                self.mode_transition.active,
+            )
+        return gain * desired_twist
+
+    def _solve_velocity_qp(
+        self, q_command, qdot_previous, qdot_previous_previous,
+        current_fk, desired_twist, dt,
+    ):
         """动态姿态版本：位置优先，偏航/滚转较硬，俯仰较软，J4 延后。"""
         q_command = np.asarray(q_command, dtype=np.float64)
         qdot_previous = np.asarray(qdot_previous, dtype=np.float64)
+        qdot_previous_previous = np.asarray(qdot_previous_previous, dtype=np.float64)
+        with self.lock:
+            follow_gain = self.task_hold.gain
+            fully_holding = (
+                not self.mode_transition.active
+                and self.task_hold.state == TaskSpaceHold.HOLD
+                and follow_gain <= 0.0
+                and np.max(np.abs(qdot_previous)) <= 1e-3
+                and np.max(np.abs(qdot_previous_previous)) <= 2e-3
+            )
+        if fully_holding:
+            return (
+                np.zeros(JOINT_COUNT, dtype=np.float64),
+                "SOLVED",
+                0,
+                np.zeros(JOINT_COUNT, dtype=int),
+            )
         jacobian = np.asarray(self.robot.get_jacobian(q_command), dtype=np.float64)
         if jacobian.shape != (6, JOINT_COUNT) or not np.all(np.isfinite(jacobian)):
             return np.zeros(JOINT_COUNT), "NUMERICAL_FAILURE", 0, np.zeros(JOINT_COUNT, dtype=int)
@@ -1324,6 +1882,7 @@ class DynamicPoseTrackingController(TrackingController):
             np.diag(np.sqrt(np.array([0.35, 0.6, 0.6, 1.5, 1.5, 1.5]))),
             np.diag(np.sqrt(np.array([0.18, 0.8, 0.8, 8.0, 6.0, 6.0]))),
             np.diag(np.sqrt(np.array([0.0, 1.0, 1.0, 8.0, 6.0, 6.0]))),
+            np.diag(np.full(JOINT_COUNT, np.sqrt(self.args.qp_jerk_weight))),
         ]
         targets = [
             position_scale * np.asarray(desired_twist[:3], dtype=np.float64),
@@ -1331,10 +1890,14 @@ class DynamicPoseTrackingController(TrackingController):
             np.sqrt(np.array([0.35, 0.6, 0.6, 1.5, 1.5, 1.5])) * qdot_previous,
             np.zeros(JOINT_COUNT),
             np.sqrt(np.array([0.0, 1.0, 1.0, 8.0, 6.0, 6.0])) * np.clip(
-                self.args.qp_home_gain * (self.home_position - q_command),
+                follow_gain
+                * self.args.qp_home_gain
+                * (self.home_position - q_command),
                 -self.args.qp_home_speed,
                 self.args.qp_home_speed,
             ),
+            np.sqrt(self.args.qp_jerk_weight)
+            * (2.0 * qdot_previous - qdot_previous_previous),
         ]
         hessian, gradient = build_least_squares_qp(rows, targets)
 
@@ -1379,7 +1942,6 @@ class DynamicPoseTrackingController(TrackingController):
 
 # 独立动态姿态入口：不导入带手势的控制文件，也不加载旧辅助脚本。
 detect_faces = detect_faces_eye_center
-face_to_screen_target = same_height_face_to_screen_target
 TrackingController = DynamicPoseTrackingController
 
 

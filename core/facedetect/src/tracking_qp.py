@@ -10,6 +10,75 @@ from __future__ import annotations
 import numpy as np
 
 
+def _active_set_from_solution(
+    solution: np.ndarray,
+    gradient: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    tolerance: float,
+) -> np.ndarray:
+    """Classify bounds for diagnostics without changing the solution."""
+    active = np.zeros(solution.size, dtype=int)
+    active[solution <= lower + tolerance] = -1
+    active[solution >= upper - tolerance] = 1
+    # A variable exactly at both bounds is only possible for a degenerate box;
+    # keep the lower marker deterministic.
+    both = (solution <= lower + tolerance) & (solution >= upper - tolerance)
+    active[both] = -1
+    return active
+
+
+def _projected_gradient_fallback(
+    hessian: np.ndarray,
+    gradient: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    initial: np.ndarray,
+    tolerance: float,
+    max_iterations: int = 100,
+) -> tuple[np.ndarray, str, int, np.ndarray]:
+    """Find a feasible box-QP solution when the active-set path stalls.
+
+    Every iterate is projected into the original box.  The projected-gradient
+    residual is the KKT check for a bound-constrained convex QP, so a fallback
+    is only reported as solved when it is numerically stationary.
+    """
+    h = np.asarray(hessian, dtype=np.float64)
+    g = np.asarray(gradient, dtype=np.float64).reshape(-1)
+    lo = np.asarray(lower, dtype=np.float64).reshape(-1)
+    hi = np.asarray(upper, dtype=np.float64).reshape(-1)
+    x = np.asarray(initial, dtype=np.float64).reshape(-1).copy()
+    if not (
+        np.all(np.isfinite(x))
+        and np.all(np.isfinite(h))
+        and np.all(np.isfinite(g))
+        and np.all(np.isfinite(lo))
+        and np.all(np.isfinite(hi))
+        and np.all(lo <= hi)
+    ):
+        return np.clip(np.zeros_like(g), lo, hi), "NUMERICAL_FAILURE", 0, np.zeros_like(g, dtype=int)
+    x = np.clip(x, lo, hi)
+    try:
+        lipschitz = float(np.max(np.linalg.eigvalsh(h)))
+    except np.linalg.LinAlgError:
+        lipschitz = float("nan")
+    if not np.isfinite(lipschitz) or lipschitz <= 0.0:
+        return x, "NUMERICAL_FAILURE", 0, _active_set_from_solution(x, h @ x + g, lo, hi, tolerance)
+    step = 1.0 / lipschitz
+    residual_tolerance = max(float(tolerance), 1e-7)
+    for iteration in range(1, max_iterations + 1):
+        projected = np.clip(x - step * (h @ x + g), lo, hi)
+        residual = projected - x
+        x = projected
+        if np.max(np.abs(residual)) <= residual_tolerance * (1.0 + np.max(np.abs(x))):
+            return x, "SOLVED", iteration, _active_set_from_solution(
+                x, h @ x + g, lo, hi, residual_tolerance
+            )
+    return x, "NUMERICAL_FAILURE", max_iterations, _active_set_from_solution(
+        x, h @ x + g, lo, hi, residual_tolerance
+    )
+
+
 def solve_bounded_qp(
     hessian: np.ndarray,
     gradient: np.ndarray,
@@ -44,7 +113,9 @@ def solve_bounded_qp(
     try:
         x = np.clip(np.linalg.solve(h, -g), lo, hi)
     except np.linalg.LinAlgError:
-        return np.clip(np.zeros(n), lo, hi), "NUMERICAL_FAILURE", 0, np.zeros(n, dtype=int)
+        return _projected_gradient_fallback(
+            h, g, lo, hi, np.clip(np.zeros(n), lo, hi), tolerance
+        )
     state = np.zeros(n, dtype=int)
     state[x <= lo + tolerance] = -1
     state[x >= hi - tolerance] = 1
@@ -60,7 +131,7 @@ def solve_bounded_qp(
                     -g[free] - h[np.ix_(free, fixed)] @ x[fixed],
                 )
             except np.linalg.LinAlgError:
-                return np.clip(np.zeros(n), lo, hi), "NUMERICAL_FAILURE", iteration, state
+                return _projected_gradient_fallback(h, g, lo, hi, x, tolerance)
         below = free & (x < lo - tolerance)
         above = free & (x > hi + tolerance)
         if np.any(below) or np.any(above):
@@ -76,7 +147,7 @@ def solve_bounded_qp(
             state[release_upper] = 0
             continue
         return x, "SOLVED", iteration, state
-    return np.clip(x, lo, hi), "NUMERICAL_FAILURE", max_iterations, state
+    return _projected_gradient_fallback(h, g, lo, hi, x, tolerance, max_iterations=1000)
 
 
 def bounded_qp_self_test() -> None:
@@ -99,4 +170,3 @@ def build_least_squares_qp(rows: list[np.ndarray], targets: list[np.ndarray]):
     if a.shape[0] != b.size:
         raise ValueError("QP 目标维度错误")
     return a.T @ a, -(a.T @ b)
-
