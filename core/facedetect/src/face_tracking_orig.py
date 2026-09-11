@@ -95,7 +95,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rotate-rearm", type=float, default=10.0)
     parser.add_argument("--rotate-stop-delta", type=float, default=2.0)
     parser.add_argument("--warmup", type=int, default=30)
-    parser.add_argument("--screen-distance", type=float, default=0.5, help="屏幕中心到人脸的目标法向距离（米，非欧氏距离）")
+    parser.add_argument("--screen-distance", type=float, default=0.6, help="屏幕中心到人脸的目标法向距离（米，非欧氏距离）")
     parser.add_argument(
         "--portrait-center-offset",
         type=float,
@@ -963,7 +963,12 @@ class TrackingController:
         )
         if self.screen_orientation != "LANDSCAPE" and abs(self.args.portrait_center_offset) > 0.0:
             screen_vertical = np.asarray(self.screen_rotation[:, 1], dtype=np.float64)
-            raw_target = raw_target + self.args.portrait_center_offset * screen_vertical
+            orientation_sign = -1.0 if self.screen_orientation == "PORTRAIT_LEFT" else 1.0
+            raw_target = raw_target + (
+                orientation_sign
+                * self.args.portrait_center_offset
+                * screen_vertical
+            )
         with self.lock:
             if previous_status == "RETURNING":
                 self.last_ik_target = None

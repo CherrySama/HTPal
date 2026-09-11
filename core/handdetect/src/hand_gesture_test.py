@@ -29,6 +29,7 @@ DEFAULT_HOME_FILE = REPO_ROOT / "core" / "detect_test_pos.md"
 DEFAULT_CONFIG = REPO_ROOT / "panthera_python" / "robot_param" / "Follower_tracking.yaml"
 WINDOW = "HTPal hand gesture test"
 JOINT_COUNT = 6
+_LAST_HAND_TIMESTAMP_MS = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -475,7 +476,7 @@ class MotionExecutor:
 def create_landmarker(args: argparse.Namespace):
     options = vision.HandLandmarkerOptions(
         base_options=python.BaseOptions(model_asset_path=str(args.model.resolve())),
-        running_mode=vision.RunningMode.IMAGE,
+        running_mode=vision.RunningMode.VIDEO,
         num_hands=args.num_hands,
         min_hand_detection_confidence=args.min_detection,
         min_hand_presence_confidence=args.min_presence,
@@ -526,12 +527,18 @@ def sample_hand(
     depth_frame,
     hand_score_min: float = 0.75,
     palm_depth_spread_max: float = 0.08,
+    timestamp_ms: int | None = None,
 ):
+    global _LAST_HAND_TIMESTAMP_MS
     image = mp.Image(
         image_format=mp.ImageFormat.SRGB,
         data=cv2.cvtColor(color, cv2.COLOR_BGR2RGB),
     )
-    result = landmarker.detect(image)
+    if timestamp_ms is None:
+        timestamp_ms = time.monotonic_ns() // 1_000_000
+    timestamp_ms = max(int(timestamp_ms), _LAST_HAND_TIMESTAMP_MS + 1)
+    _LAST_HAND_TIMESTAMP_MS = timestamp_ms
+    result = landmarker.detect_for_video(image, timestamp_ms)
     if not result.hand_landmarks:
         return None
     hand_index = 0
