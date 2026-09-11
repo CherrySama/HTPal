@@ -54,7 +54,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--push-rearm", type=float, default=0.025, help="前后推动作重新布防的中立范围（米）")
     parser.add_argument("--smoothing-alpha", type=float, default=0.20)
     parser.add_argument("--open-required-frames", type=int, default=4, help="五指张开连续多少帧后进入 READY")
-    parser.add_argument("--open-grace-frames", type=int, default=2, help="动作中允许闭手/丢手的连续帧数")
     parser.add_argument("--push-start", type=float, default=0.025, help="进入前后移动检测的深度位移（米）")
     parser.add_argument("--settle-frames", type=int, default=3, help="动作达到阈值后需稳定停止的连续帧数")
     parser.add_argument("--push-stop-delta", type=float, default=0.004, help="判定手掌停止的单帧深度变化（米）")
@@ -92,8 +91,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("动作时长必须大于 0，smoothing-alpha 必须位于 (0, 1]")
     if args.push_trigger <= args.push_rearm or args.push_rearm < 0.0:
         raise ValueError("push-trigger 必须大于 push-rearm")
-    if args.open_required_frames <= 0 or args.open_grace_frames < 0:
-        raise ValueError("open-required-frames 必须大于 0，open-grace-frames 不能为负数")
+    if args.open_required_frames <= 0:
+        raise ValueError("open-required-frames 必须大于 0")
     if args.push_start <= 0.0 or args.push_start >= args.push_trigger:
         raise ValueError("push-start 必须大于 0 且小于 push-trigger")
     if args.settle_frames <= 0 or args.push_stop_delta <= 0.0:
@@ -136,7 +135,6 @@ class GestureState:
         self.roll_filtered = None
         self.phase = "WAIT_OPEN"
         self.open_frames = 0
-        self.closed_frames = 0
         self.active_kind = None
         self.active_direction = None
         self.peak_displacement = 0.0
@@ -153,36 +151,25 @@ class GestureState:
 
     def update(self, measurement: dict | None) -> list[str]:
         events: list[str] = []
-        is_open = bool(measurement and measurement.get("open_palm", False))
-        if is_open:
-            self.open_frames += 1
-            self.closed_frames = 0
-        else:
-            self.open_frames = 0
-            self.closed_frames += 1
-
-        # Missing/closed hands cannot be part of an accepted gesture. A few
-        # grace frames absorb landmark flicker, but a sustained interruption
-        # cancels the active motion and requires a fresh open-palm arm.
-        if self.active_kind is not None and self.closed_frames > self.args.open_grace_frames:
-            self._reset_motion("CANCELLED_NOT_OPEN")
-            return events
         if measurement is None:
-            if self.active_kind is None:
-                self._clear_reference("WAIT_OPEN")
-            self.status = "NO_HAND" if self.active_kind is None else self.status
+            self._reset_for_fresh_open("NO_HAND")
             return events
 
         depth = float(measurement["palm_depth"])
         roll = float(measurement["roll_deg"])
         if not (math.isfinite(depth) and math.isfinite(roll)):
-            self.status = "INVALID_HAND"
+            self._reset_for_fresh_open("INVALID_HAND")
             return events
 
+        is_open = bool(measurement.get("open_palm", False))
         if not is_open and self.active_kind is None:
-            self._clear_reference("WAIT_OPEN")
-            self.status = "WAIT_OPEN_PALM"
+            self._reset_for_fresh_open("WAIT_OPEN_PALM")
             return events
+        if not is_open:
+            self._reset_for_fresh_open("CANCELLED_NOT_OPEN")
+            return events
+
+        self.open_frames += 1
 
         if self.active_kind is None and self.phase == "WAIT_NEUTRAL":
             # Re-arm only after the hand has returned near the pre-action
@@ -346,6 +333,20 @@ class GestureState:
         self.status = status
         if "NOT_OPEN" in status:
             self._clear_reference("WAIT_OPEN")
+
+    def _reset_for_fresh_open(self, status: str) -> None:
+        """Discard every prior sample so the next READY gets a fresh baseline."""
+        self.active_kind = None
+        self.active_direction = None
+        self.peak_displacement = 0.0
+        self.peak_angle = 0.0
+        self.settle_frames = 0
+        self.neutral_frames = 0
+        self.neutral_depth_last = None
+        self.neutral_roll_last = None
+        self.open_frames = 0
+        self._clear_reference("WAIT_OPEN")
+        self.status = status
 
     def _clear_reference(self, phase: str = "WAIT_OPEN") -> None:
         self.depth_reference = None

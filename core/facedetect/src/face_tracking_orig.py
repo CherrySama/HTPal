@@ -85,7 +85,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--motion-max", type=float, default=0.10)
     parser.add_argument("--smoothing-alpha", type=float, default=0.20)
     parser.add_argument("--open-required-frames", type=int, default=4)
-    parser.add_argument("--open-grace-frames", type=int, default=2)
     parser.add_argument("--push-start", type=float, default=0.025)
     parser.add_argument("--push-trigger", type=float, default=0.06)
     parser.add_argument("--push-rearm", type=float, default=0.025)
@@ -97,6 +96,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rotate-stop-delta", type=float, default=2.0)
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--screen-distance", type=float, default=0.5, help="屏幕中心到人脸的目标法向距离（米，非欧氏距离）")
+    parser.add_argument(
+        "--portrait-center-offset",
+        type=float,
+        default=-0.15,
+        help="竖屏时计算用屏幕中心沿屏幕底部方向的偏移（米，可为负数）",
+    )
     parser.add_argument(
         "--camera-centering-gain",
         type=float,
@@ -233,12 +238,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--joint-limit-margin 不能为负数")
     if args.min_depth >= args.max_depth:
         raise ValueError("--min-depth 必须小于 --max-depth")
+    if not np.isfinite(args.portrait_center_offset):
+        raise ValueError("--portrait-center-offset 必须是有限数值")
     if args.cartesian_ik_eps > args.ik_eps:
         raise ValueError("--cartesian-ik-eps 不应大于 --ik-eps")
     if args.motion_min >= args.motion_max or args.motion_min > 0.0 or args.motion_max < 0.0:
         raise ValueError("motion-min/max 必须包含 HOME 的 0 位移")
-    if args.open_required_frames <= 0 or args.open_grace_frames < 0:
-        raise ValueError("open-required-frames 必须大于 0，open-grace-frames 不能为负数")
+    if args.open_required_frames <= 0:
+        raise ValueError("open-required-frames 必须大于 0")
     if args.push_start >= args.push_trigger or args.push_trigger <= args.push_rearm:
         raise ValueError("push-start < push-trigger，且 push-trigger > push-rearm")
     if args.settle_frames <= 0:
@@ -626,6 +633,7 @@ class TrackingController:
         self.tracking_enabled = False
         self.latest_point_camera = None
         self.latest_target_time = None
+        self.hand_present = False
         self.status = "HOLD"
         self.command_joint = np.asarray(robot.get_current_pos(), dtype=np.float64)
         self.command_velocity = np.zeros(JOINT_COUNT, dtype=np.float64)
@@ -671,6 +679,7 @@ class TrackingController:
             self.limit_hold_reason = None
             self.screen_joint6_target = None
             self.pending_screen_orientation = None
+            self.hand_present = False
             if not enabled:
                 self.desired_joint = self.command_joint.copy()
                 self.status = "HOLD"
@@ -685,6 +694,16 @@ class TrackingController:
         with self.lock:
             self.latest_point_camera = None
             self.latest_target_time = None
+
+    def update_hand_presence(self, present: bool) -> None:
+        """Record whether a usable hand measurement is currently visible.
+
+        A closed hand still counts as present; the gesture state machine decides
+        whether it is valid for an action. This flag only gates face-loss HOME
+        behavior.
+        """
+        with self.lock:
+            self.hand_present = bool(present)
 
     def apply_gesture_event(self, event: str, gesture_state: GestureState) -> None:
         """Apply a distance step or queue a J6-only screen rotation."""
@@ -819,6 +838,7 @@ class TrackingController:
                 target_time = self.latest_target_time
                 status = self.status
                 screen_joint6_target = self.screen_joint6_target
+                hand_present = self.hand_present
                 command_joint = self.command_joint.copy()
                 command_velocity = self.command_velocity.copy()
             fresh = point_camera is not None and target_time is not None and now - target_time <= self.args.target_timeout
@@ -844,7 +864,7 @@ class TrackingController:
                         point_camera, status, command_joint, command_velocity, dt
                     )
                 else:
-                    self._handle_lost_target(now)
+                    self._handle_lost_target(now, hand_present)
 
                 with self.lock:
                     if self.status == "RETURNING" and fresh:
@@ -941,6 +961,9 @@ class TrackingController:
             self.screen_rotation,
             self.args.camera_centering_gain,
         )
+        if self.screen_orientation != "LANDSCAPE" and abs(self.args.portrait_center_offset) > 0.0:
+            screen_vertical = np.asarray(self.screen_rotation[:, 1], dtype=np.float64)
+            raw_target = raw_target + self.args.portrait_center_offset * screen_vertical
         with self.lock:
             if previous_status == "RETURNING":
                 self.last_ik_target = None
@@ -1187,8 +1210,14 @@ class TrackingController:
                 high = high if direction > 0.0 else mid
         return best_position, best_q
 
-    def _handle_lost_target(self, now: float) -> None:
+    def _handle_lost_target(self, now: float, hand_present: bool = False) -> None:
         with self.lock:
+            if hand_present:
+                self.lost_since = None
+                self.desired_joint = self.command_joint.copy()
+                self.command_velocity.fill(0.0)
+                self.status = "HOLD_HAND"
+                return
             if self.status == "HOME":
                 self.desired_joint = self.preferred_home_position.copy()
                 return
@@ -1302,7 +1331,6 @@ def main() -> int:
         motion_max=args.motion_max,
         smoothing_alpha=args.smoothing_alpha,
         open_required_frames=args.open_required_frames,
-        open_grace_frames=args.open_grace_frames,
         push_start=args.push_start,
         push_trigger=args.push_trigger,
         push_rearm=args.push_rearm,
@@ -1353,6 +1381,7 @@ def main() -> int:
                 args.hand_score_min,
                 args.palm_depth_spread_max,
             )
+            controller.update_hand_presence(hand_measurement is not None)
             events = gesture_state.update(hand_measurement if enabled else None)
             if enabled:
                 for event in events:
