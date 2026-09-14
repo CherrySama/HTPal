@@ -93,12 +93,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--screen-distance", type=float, default=0.5, help="屏幕中心到人脸的目标法向距离（米，非欧氏距离）")
     parser.add_argument(
-        "--screen-center-offset",
-        type=float,
-        default=-0.05,
-        help="计算用屏幕中心沿屏幕局部垂直轴的偏移（米，可为负数）",
-    )
-    parser.add_argument(
         "--camera-centering-gain",
         type=float,
         default=1.0,
@@ -156,8 +150,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--warmup 和 --depth-radius 不能为负数")
     if args.confirm_frames <= 0:
         raise ValueError("--confirm-frames 必须大于 0")
-    if not np.isfinite(args.screen_center_offset):
-        raise ValueError("--screen-center-offset 必须是有限数值")
     if args.recline_baseline_frames <= 0:
         raise ValueError("--recline-baseline-frames 必须大于 0")
     if not 0.0 < args.recline_pose_alpha <= 1.0:
@@ -1660,7 +1652,7 @@ class DynamicPoseTrackingController(TrackingController):
         filtered_face_camera = np.linalg.inv(t_base_camera) @ np.append(
             filtered_face_base, 1.0
         )
-        target = face_to_screen_target(
+        return face_to_screen_target(
             filtered_face_camera[:3],
             fk,
             self.camera_rotation,
@@ -1668,10 +1660,6 @@ class DynamicPoseTrackingController(TrackingController):
             self.screen_rotation,
             self.args.camera_centering_gain,
         )
-        if abs(self.args.screen_center_offset) > 0.0:
-            screen_vertical = np.asarray(self.screen_rotation[:, 1], dtype=np.float64)
-            target = target + self.args.screen_center_offset * screen_vertical
-        return target
 
     def _smooth_face_target(self, raw_target: np.ndarray) -> np.ndarray:
         # 人脸位置已在不随相机运动的基坐标系滤波；模式位移由五次进度生成。
